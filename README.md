@@ -28,3 +28,13 @@ or browser profiles.
 
 The generated `out/` directories are intentionally excluded and must be
 rebuilt locally.
+
+## Latest upstream snapshot
+
+The current upstream-based checkout uses Chromium commit
+`6ec4ee43f0aea01464d220c8bd87e4674d1ae9df`. To restore the Google account
+sync UI change on that checkout, apply:
+
+```powershell
+git am <path-to-this-repo>\patches\0002-restore-google-account-sync-ui.patch
+```

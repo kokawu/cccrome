@@ -1,0 +1,93 @@
+From f814dcff4bc490606bee86cf0579140109f27623 Mon Sep 17 00:00:00 2001
+From: kokawu <kokawu@users.noreply.github.com>
+Date: Tue, 25 Aug 2026 23:50:00 +0800
+Subject: [PATCH] restore Google account sync UI
+
+---
+ .../settings/people_page/people_page.html.ts         | 12 ++++++------
+ .../people_page/sync_account_control.html.ts         |  4 ++--
+ .../settings/people_page/sync_account_control.ts     |  8 +++++---
+ 3 files changed, 13 insertions(+), 11 deletions(-)
+
+diff --git a/chrome/browser/resources/settings/people_page/people_page.html.ts b/chrome/browser/resources/settings/people_page/people_page.html.ts
+index b3303085ac..d01a9da81e 100644
+--- a/chrome/browser/resources/settings/people_page/people_page.html.ts
++++ b/chrome/browser/resources/settings/people_page/people_page.html.ts
+@@ -10,19 +10,19 @@ import type {SettingsPeoplePageElement} from './people_page.js';
+ 
+ export function getHtml(this: SettingsPeoplePageElement) {
+   return html`<!--_html_template_start_-->
+-<settings-section page-title="$i18n{peoplePageTitle}">
++<settings-section page-title="Google 登录/同步">
+       <div>
+ 
+ <if expr="not is_chromeos">
+         ${this.shouldShowSyncAccountControl_() ? html`
+           <settings-sync-account-control
+               .syncStatus="${this.syncStatus!}"
+-              promo-label-with-account="$i18n{peopleSignInPrompt}"
+-              promo-label-with-no-account="$i18n{peopleSignInPrompt}"
++              promo-label-with-account="Google 登录/同步"
++              promo-label-with-no-account="Google 登录/同步"
+               promo-secondary-label-with-account=
+-                  "$i18n{peopleSignInPromptSecondaryWithAccount}"
++                  "使用当前 Google 账号登录并同步"
+               promo-secondary-label-with-no-account=
+-                  "$i18n{peopleSignInPromptSecondaryWithNoAccount}"
++                  "登录 Google 账号后，可同步书签、密码、历史记录和设置"
+               .accessPoint="${ChromeSigninAccessPoint.SETTINGS}">
+           </settings-sync-account-control>
+         ` : ''}
+@@ -91,7 +91,7 @@ export function getHtml(this: SettingsPeoplePageElement) {
+         </cr-link-row>
+ 
+         <cr-link-row id="sync-setup"
+-            label="$i18n{syncAndNonPersonalizedServices}"
++            label="Google 同步设置"
+             .subLabel="${this.getSyncAndNonPersonalizedServicesSubtext_()}"
+             @click="${this.onSyncClick_}"
+             role-description="$i18n{subpageArrowRoleDescription}"
+diff --git a/chrome/browser/resources/settings/people_page/sync_account_control.html.ts b/chrome/browser/resources/settings/people_page/sync_account_control.html.ts
+index f2f90df3b7..66090d7aad 100644
+--- a/chrome/browser/resources/settings/people_page/sync_account_control.html.ts
++++ b/chrome/browser/resources/settings/people_page/sync_account_control.html.ts
+@@ -25,7 +25,7 @@ export function getHtml(this: SettingsSyncAccountControlElement) {
+           id="signIn"
+           ?disabled="${this.shouldDisableSyncButton_()}"
+           ?hidden="${this.shouldShowAvatarRow_}">
+-        $i18n{peopleSignInNoAccountAwareness}
++        Google 登录/同步
+       </cr-button>
+     </div>
+     </if>
+@@ -76,7 +76,7 @@ export function getHtml(this: SettingsSyncAccountControlElement) {
+             ?hidden="${this.shouldHideSyncButton_()}"
+             @click="${this.onSyncButtonClick_}"
+             ?disabled="${this.shouldDisableSyncButton_()}">
+-          $i18n{turnOnSync}
++          开启 Google 同步
+         </cr-button>
+         <cr-button id="turn-off"
+             class="cr-button-gap"
+diff --git a/chrome/browser/resources/settings/people_page/sync_account_control.ts b/chrome/browser/resources/settings/people_page/sync_account_control.ts
+index 92be0e8471..18b70f9704 100644
+--- a/chrome/browser/resources/settings/people_page/sync_account_control.ts
++++ b/chrome/browser/resources/settings/people_page/sync_account_control.ts
+@@ -369,9 +369,11 @@ export class SettingsSyncAccountControlElement extends
+   }
+ 
+   protected getAccountAwareSigninButtonLabel_(): string {
+-    return loadTimeData.substituteString(
+-        loadTimeData.getString('accountAwareSigninButtonLabel'),
+-        this.shownAccount_?.givenName || '');
++    const givenName = this.shownAccount_?.givenName || '';
++    if (givenName) {
++      return `Google 登录/同步（${givenName}）`;
++    }
++    return 'Google 登录/同步';
+   }
+ 
+   protected getProfileImageSrc_(image: string|null, profileAvatarURL: string):
+-- 
+2.50.1.windows.1
+
