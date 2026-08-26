@@ -26,7 +26,8 @@ or browser profiles.
 3. Copy the files from `workspace/` to the Chromium workspace root if the
    local build wrapper and notes are needed.
 
-4. Put the private `google_api_key`, `google_default_client_id`, and
+4. To expose the Chromium browser sign-in UI, put the private
+   `google_api_key`, `google_default_client_id`, and
    `google_default_client_secret` values in the local
    `src/out/UpstreamFastDev/args.gn`. Do not commit those values.
 
@@ -38,7 +39,17 @@ or browser profiles.
    ```
 
 6. Start `src/out/UpstreamFastDev/chrome.exe` normally. No launcher or OAuth
-   command-line parameters are required.
+   command-line parameters are required for the UI to appear.
+
+## Google sync limitation
+
+The OAuth build settings only enable the browser sign-in UI. They do not grant
+access to Google's private Chrome Sync service. In the current build, Google
+accepts the website login cookie but returns no browser authorization code, so
+Chromium cannot store a refresh token and remains signed out.
+
+Do not spend time on a full rebuild to address this behavior. It is a service
+authorization limitation, not a missing UI or Chromium build target.
 
 The generated `out/` directories are intentionally excluded and must be
 rebuilt locally.
