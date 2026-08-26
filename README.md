@@ -14,10 +14,6 @@ or browser profiles.
 - `patches/`: Git patch containing the custom browser source changes.
 - `workspace/`: Local build helpers, feature notes, and reference material.
 
-The `workspace/ccgoogle.ps1` launcher starts the custom Chromium build with
-the local Google OAuth settings, without storing those settings in this
-repository.
-
 ## Restore
 
 1. Check out Chromium at the base commit above.
@@ -30,10 +26,19 @@ repository.
 3. Copy the files from `workspace/` to the Chromium workspace root if the
    local build wrapper and notes are needed.
 
-4. Put the private `google_default_client_id` and
-   `google_default_client_secret` values in the local `src/out/UpstreamFastDev/args.gn`,
-   then run `ccgoogle.cmd` from the workspace root to open the Google sign-in
-   settings page.
+4. Put the private `google_api_key`, `google_default_client_id`, and
+   `google_default_client_secret` values in the local
+   `src/out/UpstreamFastDev/args.gn`. Do not commit those values.
+
+5. Regenerate the build files and rebuild the Google API component:
+
+   ```powershell
+   gn gen out\UpstreamFastDev
+   autoninja --fast_local -C out\UpstreamFastDev google_apis
+   ```
+
+6. Start `src/out/UpstreamFastDev/chrome.exe` normally. No launcher or OAuth
+   command-line parameters are required.
 
 The generated `out/` directories are intentionally excluded and must be
 rebuilt locally.
