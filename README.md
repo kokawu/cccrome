@@ -14,7 +14,7 @@ or browser profiles.
 - `patches/`: Git patch containing the custom browser source changes.
 - `workspace/`: Local build helpers, feature notes, and reference material.
 
-## Restore
+## Restore the Chromium 148 checkpoint
 
 1. Check out Chromium at the base commit above.
 2. From the Chromium `src` directory, apply the patch:
@@ -41,25 +41,47 @@ or browser profiles.
 6. Start `src/out/UpstreamFastDev/chrome.exe` normally. No launcher or OAuth
    command-line parameters are required for the UI to appear.
 
-## Google sync limitation
+## Restore the current Chromium 154 build
 
-The OAuth build settings only enable the browser sign-in UI. They do not grant
-access to Google's private Chrome Sync service. In the current build, Google
-accepts the website login cookie but returns no browser authorization code, so
-Chromium cannot store a refresh token and remains signed out.
+The current upstream-based checkout uses Chromium commit
+`6ec4ee43f0aea01464d220c8bd87e4674d1ae9df`.
 
-Do not spend time on a full rebuild to address this behavior. It is a service
-authorization limitation, not a missing UI or Chromium build target.
+1. Check out Chromium at the commit above.
+2. Apply the current patches in order:
+
+   ```powershell
+   git am <path-to-this-repo>\patches\0002-restore-google-account-sync-ui.patch
+   git am <path-to-this-repo>\patches\0003-Add-browser-control-CLI-and-proxy-management.patch
+   ```
+
+3. Put the private Google API key, OAuth client ID, and OAuth client secret in
+   the local `out/UpstreamFastDev/args.gn`. Never commit those values.
+4. Generate and fully build the browser target:
+
+   ```powershell
+   gn gen out\UpstreamFastDev
+   autoninja -C out\UpstreamFastDev chrome
+   ```
+
+5. Start the browser normally, or use the automation CLI:
+
+   ```powershell
+   .\ccchrome.cmd up
+   .\ccchrome.cmd open https://example.com
+   .\ccchrome.cmd tabs
+   .\ccchrome.cmd proxy show
+   ```
+
+## Google sync verification
+
+Google account login and sync are working in the Chromium 154 build. The
+earlier `no_authorization_code` result came from an incomplete incremental
+build that mixed stale and current browser components. A full `chrome` target
+build regenerated the matching executable and DLL set and restored sign-in.
+
+After changing Google API settings, DICE/sign-in code, Chrome settings UI, or
+other core browser code, rebuild the complete `chrome` target before testing.
+Rebuilding only `google_apis` is not sufficient for this checkout.
 
 The generated `out/` directories are intentionally excluded and must be
 rebuilt locally.
-
-## Latest upstream snapshot
-
-The current upstream-based checkout uses Chromium commit
-`6ec4ee43f0aea01464d220c8bd87e4674d1ae9df`. To restore the Google account
-sync UI change on that checkout, apply:
-
-```powershell
-git am <path-to-this-repo>\patches\0002-restore-google-account-sync-ui.patch
-```
