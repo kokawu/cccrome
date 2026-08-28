@@ -1,0 +1,2940 @@
+From 2046ed21d11cdcad5c332e9a8ee5dbfdc506949f Mon Sep 17 00:00:00 2001
+From: kokawu <kokawu@users.noreply.github.com>
+Date: Fri, 28 Aug 2026 14:16:56 +0800
+Subject: [PATCH 4/4] Add managed Mihomo proxy dashboard
+
+---
+ tools/browserctl/README.md            |   60 ++
+ tools/browserctl/browserd.py          |  122 ++-
+ tools/browserctl/ccchrome.py          |    9 +
+ tools/browserctl/common.py            |   30 +-
+ tools/browserctl/common_unittest.py   |    8 +
+ tools/browserctl/launcher.py          |  239 +++++
+ tools/browserctl/mihomo.py            | 1157 +++++++++++++++++++++++++
+ tools/browserctl/mihomo_unittest.py   |  120 +++
+ tools/browserctl/proxy_dashboard.html |  931 ++++++++++++++++++++
+ 9 files changed, 2645 insertions(+), 31 deletions(-)
+ create mode 100644 tools/browserctl/mihomo.py
+ create mode 100644 tools/browserctl/mihomo_unittest.py
+ create mode 100644 tools/browserctl/proxy_dashboard.html
+
+diff --git a/tools/browserctl/README.md b/tools/browserctl/README.md
+index d65079db4b..a5ed9dbdad 100644
+--- a/tools/browserctl/README.md
++++ b/tools/browserctl/README.md
+@@ -32,6 +32,16 @@ The first stage intentionally keeps the external interface simple:
+ * `browserctl daemon start`
+ * `browserctl daemon stop`
+ * `ccchrome proxy show`
++* `ccchrome proxy setup [subscription-url-or-yaml]`
++* `ccchrome proxy dashboard`
++* `ccchrome proxy subscription set <url-or-yaml>`
++* `ccchrome proxy subscription update`
++* `ccchrome proxy subscription clear`
++* `ccchrome proxy nodes`
++* `ccchrome proxy select <group> <node>`
++* `ccchrome proxy mode <rule|global|direct>`
++* `ccchrome proxy core <status|install|update|start|stop>`
++* `ccchrome proxy auto-update <on|off>`
+ * `ccchrome proxy set http://127.0.0.1:7890`
+ * `ccchrome proxy pac http://127.0.0.1:8080/proxy.pac`
+ * `ccchrome proxy system`
+@@ -80,6 +90,8 @@ On Windows, the shortest wrapper from the repo root is:
+ .\ccchrome.cmd eval "document.title"
+ .\ccchrome.cmd observe
+ .\ccchrome.cmd proxy set socks5://127.0.0.1:1080
++.\ccchrome.cmd proxy setup https://example.com/clash-subscription
++.\ccchrome.cmd proxy dashboard
+ .\ccchrome.cmd proxy show
+ .\ccchrome.cmd mcp
+ ```
+@@ -94,6 +106,10 @@ inside the ignored build output tree and is not committed to Git.
+ 
+ Supported modes:
+ 
++* `proxy setup` installs the official Mihomo core and MetaCubeXD dashboard,
++  optionally imports a Clash/Mihomo YAML subscription, and enables managed mode
++* `proxy managed` starts Mihomo on demand and routes only the managed browser
++  through its loopback mixed proxy port
+ * `proxy system` uses the Windows proxy configuration
+ * `proxy off` forces direct connections
+ * `proxy set` accepts Chromium proxy rules such as
+@@ -105,6 +121,50 @@ Changing the proxy restarts the managed browser when it is already running.
+ Proxy URLs containing embedded usernames or passwords are rejected because
+ Chromium command-line proxy configuration does not support them.
+ 
++## Managed proxy
++
++Managed proxy runtime files live under `out/browserctl/mihomo` and are ignored
++by Git. This includes the downloaded Mihomo executable, MetaCubeXD files,
++subscriptions, generated configuration, logs, and process state. Subscription
++URLs and credentials are never added to the source repository.
++
++The managed profile is deliberately browser-only: listeners bind to loopback,
++LAN access and TUN mode are disabled, and Chromium connects to the local mixed
++HTTP/SOCKS port. Closing the managed browser also stops Mihomo. Direct and
++system proxy modes do not start the core.
++
++Core, dashboard, and URL-based subscription updates are checked at browser
++startup, at most once per configured interval (24 hours by default). Core
++downloads use the official GitHub release asset digest when available. Before
++replacement, the new executable and active configuration are tested; a failed
++upgrade restores the previous executable. Subscription changes also keep and
++restore the last known-good profile when validation or restart fails.
++
++The first version accepts complete Clash/Mihomo YAML subscriptions or local
++YAML files. Raw Base64 URI lists need conversion to Clash/Mihomo YAML before
++import.
++
++`proxy dashboard` opens the local CCCrome proxy settings page. It can import,
++refresh, or clear a subscription; update the core and dashboard; configure the
++automatic update interval; switch rule/global/direct mode; and select or test
++nodes. Its Advanced dashboard link opens the bundled MetaCubeXD traffic,
++connections, rules, and logs interface.
++
++Useful commands:
++
++```powershell
++.\ccchrome.cmd proxy setup <subscription-url>
++.\ccchrome.cmd proxy dashboard
++.\ccchrome.cmd proxy nodes
++.\ccchrome.cmd proxy select "PROXY" "Hong Kong 01"
++.\ccchrome.cmd proxy mode rule
++.\ccchrome.cmd proxy subscription update
++.\ccchrome.cmd proxy subscription clear
++.\ccchrome.cmd proxy core update
++.\ccchrome.cmd proxy auto-update on --interval-hours 24
++.\ccchrome.cmd proxy ports --mixed 7890 --controller 9090
++```
++
+ ## Practical model
+ 
+ * `open` creates a new tab when the DevTools helper endpoint is available
+diff --git a/tools/browserctl/browserd.py b/tools/browserctl/browserd.py
+index d832d6f2fa..497257610d 100644
+--- a/tools/browserctl/browserd.py
++++ b/tools/browserctl/browserd.py
+@@ -26,6 +26,9 @@ sys.path.insert(0, str(SCRIPT_DIR))
+ 
+ import common
+ import cdp
++import mihomo
++
++_PROXY_DASHBOARD_PATH = SCRIPT_DIR / 'proxy_dashboard.html'
+ 
+ 
+ def _load_browser_control_module() -> Any:
+@@ -75,6 +78,9 @@ class BrowserSession:
+             raise common.BrowserctlError(
+                 f'Browser binary not found: {self.browser_binary}')
+ 
++        if self.proxy['mode'] == 'managed':
++            mihomo.ensure_running()
++
+         self.user_data_dir.mkdir(parents=True, exist_ok=True)
+         args = [
+             str(self.browser_binary),
+@@ -682,6 +688,11 @@ class BrowserDaemon:
+             self.httpd.serve_forever()
+         finally:
+             self.session.stop_browser()
++            if self.proxy['mode'] == 'managed':
++                try:
++                    mihomo.stop()
++                except common.BrowserctlError:
++                    pass
+             common.clear_state()
+ 
+ 
+@@ -697,11 +708,18 @@ class BrowserRequestHandler(BaseHTTPRequestHandler):
+ 
+     def _authenticate(self) -> bool:
+         token = self.headers.get('X-Browserctl-Token', '')
++        if not token:
++            query = urllib.parse.parse_qs(
++                urllib.parse.urlsplit(self.path).query)
++            token = str(query.get('token', [''])[0])
+         if token != self.controller.token:
+             self._send_json(403, {'error': 'Forbidden'})
+             return False
+         return True
+ 
++    def _request_path(self) -> str:
++        return urllib.parse.urlsplit(self.path).path
++
+     def _read_json_body(self) -> dict[str, Any]:
+         content_length = int(self.headers.get('Content-Length', '0'))
+         if content_length <= 0:
+@@ -717,27 +735,44 @@ class BrowserRequestHandler(BaseHTTPRequestHandler):
+         self.end_headers()
+         self.wfile.write(encoded)
+ 
++    def _send_html(self, status_code: int, html: str) -> None:
++        encoded = html.encode('utf-8')
++        self.send_response(status_code)
++        self.send_header('Content-Type', 'text/html; charset=utf-8')
++        self.send_header('Cache-Control', 'no-store')
++        self.send_header('Content-Length', str(len(encoded)))
++        self.end_headers()
++        self.wfile.write(encoded)
++
+     def do_GET(self) -> None:
+         if not self._authenticate():
+             return
+         try:
+-            if self.path == '/ping':
++            path = self._request_path()
++            if path == '/ping':
+                 payload = {'ok': True, 'pid': os.getpid()}
++            elif path in ('/proxy', '/proxy/'):
++                self._send_html(
++                    200, _PROXY_DASHBOARD_PATH.read_text(encoding='utf-8'))
++                return
+             else:
+                 with self.controller.command_lock:
+-                    if self.path == '/status':
++                    if path == '/status':
+                         payload = self.controller.status()
+-                    elif self.path == '/focus':
++                    elif path == '/focus':
+                         payload = self.controller.focus()
+-                    elif self.path == '/tabs':
++                    elif path == '/tabs':
+                         payload = self.controller.tabs()
+-                    elif self.path == '/windows':
++                    elif path == '/windows':
+                         payload = self.controller.windows()
+-                    elif self.path in ('/snapshot', '/screenshot'):
++                    elif path in ('/snapshot', '/screenshot'):
+                         payload = self.controller.snapshot()
++                    elif path == '/proxy/api/status':
++                        payload = mihomo.status()
++                    elif path == '/proxy/api/nodes':
++                        payload = mihomo.list_proxies()
+                     else:
+-                        self._send_json(404,
+-                                        {'error': f'Unknown path: {self.path}'})
++                        self._send_json(404, {'error': f'Unknown path: {path}'})
+                         return
+             self._send_json(200, payload)
+         except Exception as exc:
+@@ -748,47 +783,78 @@ class BrowserRequestHandler(BaseHTTPRequestHandler):
+             return
+         try:
+             payload = self._read_json_body()
++            path = self._request_path()
+             with self.controller.command_lock:
+-                if self.path == '/open':
++                if path == '/open':
+                     response = self.controller.open_url(str(payload['url']))
+-                elif self.path == '/navigate':
++                elif path == '/navigate':
+                     response = self.controller.navigate(payload)
+-                elif self.path == '/page':
++                elif path == '/page':
+                     response = self.controller.inspect_page(payload)
+-                elif self.path == '/observe':
++                elif path == '/observe':
+                     response = self.controller.observe(payload)
+-                elif self.path == '/page-screenshot':
++                elif path == '/page-screenshot':
+                     response = self.controller.capture_page_screenshot(payload)
+-                elif self.path == '/eval':
++                elif path == '/eval':
+                     response = self.controller.evaluate(payload)
+-                elif self.path == '/activate-tab':
++                elif path == '/activate-tab':
+                     response = self.controller.activate_tab(payload)
+-                elif self.path == '/click-element':
++                elif path == '/click-element':
+                     response = self.controller.click_element(payload)
+-                elif self.path == '/type-element':
++                elif path == '/type-element':
+                     response = self.controller.type_element(payload)
+-                elif self.path == '/wait-selector':
++                elif path == '/wait-selector':
+                     response = self.controller.wait_for_selector(payload)
+-                elif self.path == '/window':
++                elif path == '/window':
+                     response = self.controller.set_window_bounds(payload)
+-                elif self.path == '/click':
++                elif path == '/click':
+                     response = self.controller.click(payload)
+-                elif self.path == '/drag':
++                elif path == '/drag':
+                     response = self.controller.drag(payload)
+-                elif self.path == '/scroll':
++                elif path == '/scroll':
+                     response = self.controller.scroll(payload)
+-                elif self.path == '/type':
++                elif path == '/type':
+                     response = self.controller.type_text(payload)
+-                elif self.path == '/press':
++                elif path == '/press':
+                     response = self.controller.press(payload)
+-                elif self.path == '/wait':
++                elif path == '/wait':
+                     response = self.controller.wait(payload)
+-                elif self.path == '/shutdown':
++                elif path == '/shutdown':
+                     response = {'ok': True}
+                     self.controller.request_shutdown()
++                elif path == '/proxy/api/subscription/set':
++                    response = mihomo.set_subscription(
++                        str(payload.get('source') or ''))
++                elif path == '/proxy/api/subscription/update':
++                    response = mihomo.refresh_subscription()
++                elif path == '/proxy/api/subscription/clear':
++                    response = mihomo.clear_subscription()
++                elif path == '/proxy/api/core/update':
++                    response = {
++                        'ok': True,
++                        'core': mihomo.update_core(
++                            force=bool(payload.get('force', False))),
++                        'dashboard': mihomo.update_dashboard(
++                            force=bool(payload.get('force', False))),
++                    }
++                elif path == '/proxy/api/auto-update':
++                    response = mihomo.set_auto_update(
++                        bool(payload.get('enabled', True)),
++                        int(payload.get('interval_hours') or 24))
++                elif path == '/proxy/api/mode':
++                    response = mihomo.set_mode(str(payload.get('mode') or ''))
++                elif path == '/proxy/api/select':
++                    response = mihomo.select_proxy(
++                        str(payload.get('group') or ''),
++                        str(payload.get('node') or ''))
++                elif path == '/proxy/api/test':
++                    response = mihomo.test_proxy(
++                        str(payload.get('node') or ''),
++                        str(payload.get('url') or
++                            'https://www.gstatic.com/generate_204'),
++                        int(payload.get('timeout') or 5000))
+                 else:
+-                    self._send_json(404,
+-                                    {'error': f'Unknown path: {self.path}'})
++                    self._send_json(404, {'error': f'Unknown path: {path}'})
+                     return
+             self._send_json(200, response)
+         except Exception as exc:
+diff --git a/tools/browserctl/ccchrome.py b/tools/browserctl/ccchrome.py
+index dd16cd2ff8..388a24c4ae 100644
+--- a/tools/browserctl/ccchrome.py
++++ b/tools/browserctl/ccchrome.py
+@@ -51,6 +51,15 @@ Page commands:
+ 
+ Proxy commands:
+   proxy show
++  proxy setup [subscription-url-or-yaml]
++  proxy dashboard
++  proxy subscription set <url-or-yaml>
++  proxy subscription update
++  proxy nodes
++  proxy select <group> <node>
++  proxy mode <rule|global|direct>
++  proxy core <status|install|update|start|stop>
++  proxy auto-update <on|off>
+   proxy set <server> [--bypass <list>]
+   proxy pac <url> [--bypass <list>]
+   proxy system
+diff --git a/tools/browserctl/common.py b/tools/browserctl/common.py
+index 13cfb0509b..7950e9a535 100644
+--- a/tools/browserctl/common.py
++++ b/tools/browserctl/common.py
+@@ -10,6 +10,7 @@ from __future__ import annotations
+ import json
+ import os
+ import socket
++import sys
+ import urllib.error
+ import urllib.request
+ from pathlib import Path
+@@ -68,9 +69,9 @@ def normalize_proxy_config(value: Any) -> dict[str, str]:
+             if key in value:
+                 proxy[key] = str(value[key]).strip()
+ 
+-    if proxy['mode'] not in ('system', 'direct', 'fixed', 'pac'):
++    if proxy['mode'] not in ('system', 'direct', 'fixed', 'pac', 'managed'):
+         proxy['mode'] = 'system'
+-    if proxy['mode'] != 'fixed':
++    if proxy['mode'] not in ('fixed', 'managed'):
+         proxy['server'] = ''
+     if proxy['mode'] != 'pac':
+         proxy['pac_url'] = ''
+@@ -110,12 +111,16 @@ def proxy_command_line_args(proxy: dict[str, Any] | None = None) -> list[str]:
+         if not normalized['server']:
+             raise BrowserctlError('Fixed proxy mode requires a proxy server.')
+         args.append(f"--proxy-server={normalized['server']}")
++    elif mode == 'managed':
++        if not normalized['server']:
++            raise BrowserctlError('Managed proxy mode requires a local server.')
++        args.append(f"--proxy-server={normalized['server']}")
+     elif mode == 'pac':
+         if not normalized['pac_url']:
+             raise BrowserctlError('PAC proxy mode requires a PAC URL.')
+         args.append(f"--proxy-pac-url={normalized['pac_url']}")
+ 
+-    if normalized['bypass_list'] and mode in ('fixed', 'pac'):
++    if normalized['bypass_list'] and mode in ('fixed', 'pac', 'managed'):
+         args.append(f"--proxy-bypass-list={normalized['bypass_list']}")
+     return args
+ 
+@@ -123,6 +128,25 @@ def proxy_command_line_args(proxy: dict[str, Any] | None = None) -> list[str]:
+ def is_pid_running(pid: int | None) -> bool:
+     if not pid:
+         return False
++    if sys.platform == 'win32':
++        import ctypes
++        from ctypes import wintypes
++
++        process_query_limited_information = 0x1000
++        still_active = 259
++        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
++        handle = kernel32.OpenProcess(
++            process_query_limited_information, False, int(pid))
++        if not handle:
++            return False
++        try:
++            exit_code = wintypes.DWORD()
++            if not kernel32.GetExitCodeProcess(
++                    handle, ctypes.byref(exit_code)):
++                return False
++            return exit_code.value == still_active
++        finally:
++            kernel32.CloseHandle(handle)
+     try:
+         os.kill(int(pid), 0)
+     except OSError:
+diff --git a/tools/browserctl/common_unittest.py b/tools/browserctl/common_unittest.py
+index 2b4eefc2ff..5210eea7f8 100644
+--- a/tools/browserctl/common_unittest.py
++++ b/tools/browserctl/common_unittest.py
+@@ -43,6 +43,14 @@ class ProxyConfigTest(unittest.TestCase):
+                 'pac_url': 'http://127.0.0.1:8080/proxy.pac',
+             }))
+ 
++    def test_managed_proxy_uses_local_mihomo_server(self) -> None:
++        self.assertEqual(
++            ['--proxy-server=http://127.0.0.1:7890'],
++            common.proxy_command_line_args({
++                'mode': 'managed',
++                'server': 'http://127.0.0.1:7890',
++            }))
++
+     def test_fixed_proxy_requires_server(self) -> None:
+         with self.assertRaises(common.BrowserctlError):
+             common.proxy_command_line_args({'mode': 'fixed'})
+diff --git a/tools/browserctl/launcher.py b/tools/browserctl/launcher.py
+index 7b328254f4..11af3158de 100644
+--- a/tools/browserctl/launcher.py
++++ b/tools/browserctl/launcher.py
+@@ -12,6 +12,7 @@ import json
+ import shutil
+ import subprocess
+ import sys
++import urllib.parse
+ from pathlib import Path
+ from typing import Any
+ 
+@@ -22,6 +23,7 @@ sys.path.insert(0, str(SCRIPT_DIR))
+ 
+ import client as browserctl_client
+ import common
++import mihomo
+ 
+ _SERVER_PATH = REPO_ROOT / 'agents' / 'extensions' / 'browserctl' / 'server.py'
+ _INSTALL_PATH = REPO_ROOT / 'agents' / 'extensions' / 'install.py'
+@@ -132,6 +134,8 @@ def _apply_proxy_config(proxy: dict[str, str]) -> dict[str, Any]:
+         browserctl_client.start_daemon(browser_binary, user_data_dir,
+                                        remote_debugging_port)
+         restarted = True
++    if config['proxy']['mode'] != 'managed' and mihomo.is_running():
++        mihomo.stop()
+     return {
+         'ok': True,
+         'proxy': config['proxy'],
+@@ -143,6 +147,7 @@ def _apply_proxy_config(proxy: dict[str, str]) -> dict[str, Any]:
+ def _cmd_proxy_show(_args: argparse.Namespace) -> int:
+     _print_json({
+         'proxy': common.load_config()['proxy'],
++        'mihomo': mihomo.status(),
+         'config_file': str(common.CONFIG_FILE),
+     })
+     return 0
+@@ -187,6 +192,149 @@ def _cmd_proxy_off(_args: argparse.Namespace) -> int:
+     return 0
+ 
+ 
++def _managed_proxy_config() -> dict[str, str]:
++    settings = mihomo.load_settings()
++    return {
++        'mode': 'managed',
++        'server': f'http://127.0.0.1:{settings["mixed_port"]}',
++        'bypass_list': 'localhost;127.0.0.1;[::1]',
++    }
++
++
++def _cmd_proxy_setup(args: argparse.Namespace) -> int:
++    setup_result = mihomo.setup(args.source)
++    proxy_result = _apply_proxy_config(_managed_proxy_config())
++    _print_json({
++        'ok': True,
++        'setup': setup_result,
++        'browser_proxy': proxy_result,
++        'dashboard_url': mihomo.dashboard_url(),
++    })
++    return 0
++
++
++def _cmd_proxy_managed(_args: argparse.Namespace) -> int:
++    runtime = mihomo.ensure_running()
++    proxy_result = _apply_proxy_config(_managed_proxy_config())
++    _print_json({
++        'ok': True,
++        'runtime': runtime,
++        'browser_proxy': proxy_result,
++    })
++    return 0
++
++
++def _cmd_proxy_core_status(_args: argparse.Namespace) -> int:
++    _print_json(mihomo.status())
++    return 0
++
++
++def _cmd_proxy_core_install(args: argparse.Namespace) -> int:
++    core = mihomo.update_core(force=args.force)
++    dashboard = mihomo.update_dashboard(force=args.force)
++    _print_json({'ok': True, 'core': core, 'dashboard': dashboard})
++    return 0
++
++
++def _cmd_proxy_core_update(args: argparse.Namespace) -> int:
++    _print_json(mihomo.update_core(force=args.force))
++    return 0
++
++
++def _cmd_proxy_core_start(_args: argparse.Namespace) -> int:
++    _print_json(mihomo.start())
++    return 0
++
++
++def _cmd_proxy_core_stop(_args: argparse.Namespace) -> int:
++    _print_json(mihomo.stop())
++    return 0
++
++
++def _cmd_proxy_subscription_show(_args: argparse.Namespace) -> int:
++    _print_json(mihomo.status()['subscription'])
++    return 0
++
++
++def _cmd_proxy_subscription_set(args: argparse.Namespace) -> int:
++    _print_json(mihomo.set_subscription(args.source))
++    return 0
++
++
++def _cmd_proxy_subscription_update(_args: argparse.Namespace) -> int:
++    _print_json(mihomo.refresh_subscription())
++    return 0
++
++
++def _cmd_proxy_subscription_clear(_args: argparse.Namespace) -> int:
++    _print_json(mihomo.clear_subscription())
++    return 0
++
++
++def _cmd_proxy_ports(args: argparse.Namespace) -> int:
++    result = mihomo.set_ports(args.mixed, args.controller)
++    browser_result: dict[str, Any] | None = None
++    if common.load_config()['proxy']['mode'] == 'managed':
++        browser_result = _apply_proxy_config(_managed_proxy_config())
++    _print_json({
++        'ok': True,
++        'ports': result,
++        'browser_proxy': browser_result,
++    })
++    return 0
++
++
++def _cmd_proxy_auto_update(args: argparse.Namespace) -> int:
++    enabled = args.state == 'on'
++    _print_json(mihomo.set_auto_update(enabled, args.interval_hours))
++    return 0
++
++
++def _cmd_proxy_mode(args: argparse.Namespace) -> int:
++    _print_json(mihomo.set_mode(args.mode))
++    return 0
++
++
++def _cmd_proxy_nodes(_args: argparse.Namespace) -> int:
++    _print_json(mihomo.list_proxies())
++    return 0
++
++
++def _cmd_proxy_select(args: argparse.Namespace) -> int:
++    _print_json(mihomo.select_proxy(args.group, args.node))
++    return 0
++
++
++def _cmd_proxy_test(args: argparse.Namespace) -> int:
++    _print_json(mihomo.test_proxy(args.node, args.url, args.timeout))
++    return 0
++
++
++def _cmd_proxy_dashboard(args: argparse.Namespace) -> int:
++    runtime_status = mihomo.status()
++    if not runtime_status['installed']:
++        mihomo.setup()
++    elif not runtime_status['dashboard_installed']:
++        mihomo.update_dashboard()
++    mihomo.ensure_running()
++    if common.load_config()['proxy']['mode'] != 'managed':
++        _apply_proxy_config(_managed_proxy_config())
++    client = _make_client(args)
++    daemon_state = client.start_daemon()
++    query = urllib.parse.urlencode({'token': daemon_state['token']})
++    url = f'{common.daemon_url(daemon_state, "/proxy/")}?{query}'
++    opened = None
++    if not args.no_open:
++        opened = client.open(url)
++    _print_json({
++        'ok': True,
++        'url': url,
++        'advanced_url': mihomo.dashboard_url(),
++        'opened': opened,
++    })
++    return 0
++
++
+ def _cmd_doctor(args: argparse.Namespace) -> int:
+     command = _server_command(args) + ['--self-test']
+     completed = subprocess.run(command, cwd=str(REPO_ROOT), check=False)
+@@ -297,6 +445,97 @@ def _parse_args() -> argparse.Namespace:
+         'off', help='Force direct connections without a proxy.')
+     proxy_off_parser.set_defaults(func=_cmd_proxy_off)
+ 
++    proxy_setup_parser = proxy_subparsers.add_parser(
++        'setup', help='Install Mihomo and enable the managed proxy.')
++    proxy_setup_parser.add_argument(
++        'source', nargs='?', default='',
++        help='Optional Clash/Mihomo subscription URL or YAML file.')
++    proxy_setup_parser.set_defaults(func=_cmd_proxy_setup)
++
++    proxy_managed_parser = proxy_subparsers.add_parser(
++        'managed', help='Use the locally managed Mihomo proxy.')
++    proxy_managed_parser.set_defaults(func=_cmd_proxy_managed)
++
++    proxy_core_parser = proxy_subparsers.add_parser(
++        'core', help='Manage the Mihomo core and dashboard.')
++    proxy_core_subparsers = proxy_core_parser.add_subparsers(
++        dest='proxy_core_command', required=True)
++    proxy_core_status_parser = proxy_core_subparsers.add_parser('status')
++    proxy_core_status_parser.set_defaults(func=_cmd_proxy_core_status)
++    proxy_core_install_parser = proxy_core_subparsers.add_parser('install')
++    proxy_core_install_parser.add_argument('--force', action='store_true')
++    proxy_core_install_parser.set_defaults(func=_cmd_proxy_core_install)
++    proxy_core_update_parser = proxy_core_subparsers.add_parser('update')
++    proxy_core_update_parser.add_argument('--force', action='store_true')
++    proxy_core_update_parser.set_defaults(func=_cmd_proxy_core_update)
++    proxy_core_start_parser = proxy_core_subparsers.add_parser('start')
++    proxy_core_start_parser.set_defaults(func=_cmd_proxy_core_start)
++    proxy_core_stop_parser = proxy_core_subparsers.add_parser('stop')
++    proxy_core_stop_parser.set_defaults(func=_cmd_proxy_core_stop)
++
++    proxy_subscription_parser = proxy_subparsers.add_parser(
++        'subscription', help='Import or refresh a Clash/Mihomo subscription.')
++    proxy_subscription_subparsers = proxy_subscription_parser.add_subparsers(
++        dest='proxy_subscription_command', required=True)
++    proxy_subscription_show_parser = (
++        proxy_subscription_subparsers.add_parser('show'))
++    proxy_subscription_show_parser.set_defaults(
++        func=_cmd_proxy_subscription_show)
++    proxy_subscription_set_parser = (
++        proxy_subscription_subparsers.add_parser('set'))
++    proxy_subscription_set_parser.add_argument('source')
++    proxy_subscription_set_parser.set_defaults(
++        func=_cmd_proxy_subscription_set)
++    proxy_subscription_update_parser = (
++        proxy_subscription_subparsers.add_parser('update'))
++    proxy_subscription_update_parser.set_defaults(
++        func=_cmd_proxy_subscription_update)
++    proxy_subscription_clear_parser = (
++        proxy_subscription_subparsers.add_parser('clear'))
++    proxy_subscription_clear_parser.set_defaults(
++        func=_cmd_proxy_subscription_clear)
++
++    proxy_ports_parser = proxy_subparsers.add_parser(
++        'ports', help='Set Mihomo local proxy and controller ports.')
++    proxy_ports_parser.add_argument('--mixed', type=int, default=7890)
++    proxy_ports_parser.add_argument('--controller', type=int, default=9090)
++    proxy_ports_parser.set_defaults(func=_cmd_proxy_ports)
++
++    proxy_auto_update_parser = proxy_subparsers.add_parser(
++        'auto-update', help='Enable or disable background updates.')
++    proxy_auto_update_parser.add_argument('state', choices=('on', 'off'))
++    proxy_auto_update_parser.add_argument('--interval-hours', type=int)
++    proxy_auto_update_parser.set_defaults(func=_cmd_proxy_auto_update)
++
++    proxy_mode_parser = proxy_subparsers.add_parser(
++        'mode', help='Set Mihomo rule, global, or direct mode.')
++    proxy_mode_parser.add_argument('mode', choices=('rule', 'global', 'direct'))
++    proxy_mode_parser.set_defaults(func=_cmd_proxy_mode)
++
++    proxy_nodes_parser = proxy_subparsers.add_parser(
++        'nodes', help='List selectable Mihomo proxy groups and nodes.')
++    proxy_nodes_parser.set_defaults(func=_cmd_proxy_nodes)
++
++    proxy_select_parser = proxy_subparsers.add_parser(
++        'select', help='Select a node in a Mihomo proxy group.')
++    proxy_select_parser.add_argument('group')
++    proxy_select_parser.add_argument('node')
++    proxy_select_parser.set_defaults(func=_cmd_proxy_select)
++
++    proxy_test_parser = proxy_subparsers.add_parser(
++        'test', help='Measure one Mihomo node latency.')
++    proxy_test_parser.add_argument('node')
++    proxy_test_parser.add_argument(
++        '--url', default='https://www.gstatic.com/generate_204')
++    proxy_test_parser.add_argument('--timeout', type=int, default=5000)
++    proxy_test_parser.set_defaults(func=_cmd_proxy_test)
++
++    proxy_dashboard_parser = proxy_subparsers.add_parser(
++        'dashboard', help='Open the local MetaCubeXD management page.')
++    proxy_dashboard_parser.add_argument('--no-open', action='store_true')
++    _add_shared_client_args(proxy_dashboard_parser)
++    proxy_dashboard_parser.set_defaults(func=_cmd_proxy_dashboard)
++
+     doctor_parser = subparsers.add_parser(
+         'doctor',
+         help='Run a real self-test against the MCP wrapper and managed browser.')
+diff --git a/tools/browserctl/mihomo.py b/tools/browserctl/mihomo.py
+new file mode 100644
+index 0000000000..bae1506134
+--- /dev/null
++++ b/tools/browserctl/mihomo.py
+@@ -0,0 +1,1157 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++"""Mihomo runtime, subscription, dashboard, and update management."""
++
++from __future__ import annotations
++
++import argparse
++import datetime
++import hashlib
++import json
++import os
++import platform
++import re
++import shutil
++import signal
++import socket
++import subprocess
++import sys
++import tarfile
++import tempfile
++import time
++import urllib.error
++import urllib.parse
++import urllib.request
++import zipfile
++from pathlib import Path
++from typing import Any
++
++SCRIPT_DIR = Path(__file__).resolve().parent
++sys.path.insert(0, str(SCRIPT_DIR))
++sys.path.insert(0, str(SCRIPT_DIR.parents[1] / 'third_party'))
++
++import common
++import pyyaml as yaml
++
++MIHOMO_HOME = common.RUNTIME_DIR / 'mihomo'
++MIHOMO_BINARY = MIHOMO_HOME / 'mihomo.exe'
++MIHOMO_BACKUP_BINARY = MIHOMO_HOME / 'mihomo.previous.exe'
++MIHOMO_STATE_FILE = MIHOMO_HOME / 'cccrome-manager-state.json'
++MIHOMO_LOG_FILE = MIHOMO_HOME / 'mihomo.log'
++MIHOMO_PROFILE_FILE = MIHOMO_HOME / 'active.yaml'
++MIHOMO_LAST_GOOD_PROFILE = MIHOMO_HOME / 'active.last-good.yaml'
++MIHOMO_SUBSCRIPTION_FILE = MIHOMO_HOME / 'subscription.yaml'
++MIHOMO_UI_DIR = MIHOMO_HOME / 'ui'
++MIHOMO_LOCK_FILE = MIHOMO_HOME / 'maintenance.lock'
++
++MIHOMO_RELEASE_API = (
++    'https://api.github.com/repos/MetaCubeX/mihomo/releases/latest')
++DASHBOARD_RELEASE_API = (
++    'https://api.github.com/repos/MetaCubeX/metacubexd/releases/latest')
++DEFAULT_MIXED_PORT = 7890
++DEFAULT_CONTROLLER_PORT = 9090
++DEFAULT_UPDATE_INTERVAL_HOURS = 24
++MAX_PROFILE_BYTES = 16 * 1024 * 1024
++USER_AGENT = 'CCCrome/1.0 clash.meta'
++
++_DEFAULT_SETTINGS: dict[str, Any] = {
++    'mixed_port': DEFAULT_MIXED_PORT,
++    'controller_port': DEFAULT_CONTROLLER_PORT,
++    'secret': '',
++    'auto_update': True,
++    'update_interval_hours': DEFAULT_UPDATE_INTERVAL_HOURS,
++    'subscription_update_interval_hours': DEFAULT_UPDATE_INTERVAL_HOURS,
++    'subscription_source': '',
++    'subscription_kind': '',
++    'core_version': '',
++    'dashboard_version': '',
++    'last_core_update_check': '',
++    'last_dashboard_update_check': '',
++    'last_subscription_update': '',
++}
++
++
++def _utc_now() -> str:
++    return datetime.datetime.now(datetime.timezone.utc).isoformat()
++
++
++def _parse_timestamp(value: str) -> datetime.datetime | None:
++    if not value:
++        return None
++    try:
++        parsed = datetime.datetime.fromisoformat(value)
++    except ValueError:
++        return None
++    if parsed.tzinfo is None:
++        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
++    return parsed
++
++
++def _is_due(value: str, interval_hours: int) -> bool:
++    parsed = _parse_timestamp(value)
++    if parsed is None:
++        return True
++    elapsed = datetime.datetime.now(datetime.timezone.utc) - parsed
++    return elapsed >= datetime.timedelta(hours=max(1, interval_hours))
++
++
++def ensure_home() -> None:
++    common.ensure_runtime_dir()
++    MIHOMO_HOME.mkdir(parents=True, exist_ok=True)
++
++
++def normalize_settings(value: Any) -> dict[str, Any]:
++    settings = dict(_DEFAULT_SETTINGS)
++    if isinstance(value, dict):
++        for key in settings:
++            if key in value:
++                settings[key] = value[key]
++
++    for key, default in (
++            ('mixed_port', DEFAULT_MIXED_PORT),
++            ('controller_port', DEFAULT_CONTROLLER_PORT),
++            ('update_interval_hours', DEFAULT_UPDATE_INTERVAL_HOURS),
++            ('subscription_update_interval_hours',
++             DEFAULT_UPDATE_INTERVAL_HOURS)):
++        try:
++            settings[key] = int(settings[key])
++        except (TypeError, ValueError):
++            settings[key] = default
++
++    settings['mixed_port'] = min(max(settings['mixed_port'], 1), 65535)
++    settings['controller_port'] = min(
++        max(settings['controller_port'], 1), 65535)
++    settings['update_interval_hours'] = max(
++        settings['update_interval_hours'], 1)
++    settings['subscription_update_interval_hours'] = max(
++        settings['subscription_update_interval_hours'], 1)
++    settings['auto_update'] = bool(settings['auto_update'])
++    for key in settings:
++        if key not in {
++                'mixed_port', 'controller_port', 'update_interval_hours',
++                'subscription_update_interval_hours', 'auto_update'
++        }:
++            settings[key] = str(settings[key] or '').strip()
++    return settings
++
++
++def load_settings() -> dict[str, Any]:
++    return normalize_settings(common.load_config().get('mihomo'))
++
++
++def save_settings(settings: dict[str, Any]) -> dict[str, Any]:
++    config = common.load_config()
++    normalized = normalize_settings(settings)
++    config['mihomo'] = normalized
++    common.save_config(config)
++    return normalized
++
++
++def update_settings(**changes: Any) -> dict[str, Any]:
++    settings = load_settings()
++    settings.update(changes)
++    return save_settings(settings)
++
++
++def _request(url: str,
++             method: str = 'GET',
++             body: dict[str, Any] | None = None,
++             headers: dict[str, str] | None = None,
++             timeout: float = 30.0) -> tuple[bytes, dict[str, str]]:
++    request_headers = {'User-Agent': USER_AGENT}
++    request_headers.update(headers or {})
++    data = None
++    if body is not None:
++        request_headers.setdefault('Content-Type', 'application/json')
++        data = json.dumps(body, ensure_ascii=False).encode('utf-8')
++    request = urllib.request.Request(url, data=data, method=method)
++    for key, value in request_headers.items():
++        request.add_header(key, value)
++
++    try:
++        with urllib.request.urlopen(request, timeout=timeout) as response:
++            length = response.headers.get('Content-Length')
++            if length and int(length) > MAX_PROFILE_BYTES * 4:
++                raise common.BrowserctlError(
++                    f'Download is unexpectedly large: {length} bytes.')
++            payload = response.read(MAX_PROFILE_BYTES * 4 + 1)
++            if len(payload) > MAX_PROFILE_BYTES * 4:
++                raise common.BrowserctlError('Download exceeds the size limit.')
++            response_headers = dict(response.headers.items())
++            return payload, response_headers
++    except urllib.error.HTTPError as exc:
++        detail = exc.read(2048).decode('utf-8', errors='replace').strip()
++        raise common.BrowserctlError(
++            f'{method} {url} failed with HTTP {exc.code}: {detail}') from exc
++    except urllib.error.URLError as exc:
++        raise common.BrowserctlError(
++            f'{method} {url} failed: {exc.reason}') from exc
++    except OSError as exc:
++        raise common.BrowserctlError(f'{method} {url} failed: {exc}') from exc
++
++
++def _request_json(url: str, timeout: float = 30.0) -> dict[str, Any]:
++    payload, _ = _request(
++        url, headers={'Accept': 'application/vnd.github+json'},
++        timeout=timeout)
++    try:
++        parsed = json.loads(payload.decode('utf-8'))
++    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
++        raise common.BrowserctlError(
++            f'Invalid JSON response from {url}.') from exc
++    if not isinstance(parsed, dict):
++        raise common.BrowserctlError(f'Unexpected JSON response from {url}.')
++    return parsed
++
++
++def _download_asset(asset: dict[str, Any], target: Path) -> None:
++    url = str(asset.get('browser_download_url') or '')
++    if not url:
++        raise common.BrowserctlError('Release asset has no download URL.')
++    payload, _ = _request(url, timeout=180.0)
++    digest = str(asset.get('digest') or '')
++    if digest.startswith('sha256:'):
++        actual = hashlib.sha256(payload).hexdigest()
++        expected = digest.partition(':')[2].lower()
++        if actual.lower() != expected:
++            raise common.BrowserctlError(
++                f'Checksum mismatch for {asset.get("name", "asset")}')
++    target.write_bytes(payload)
++
++
++def _release_asset(release: dict[str, Any],
++                   predicate: Any) -> dict[str, Any]:
++    assets = release.get('assets')
++    if not isinstance(assets, list):
++        raise common.BrowserctlError('Release does not contain assets.')
++    for asset in assets:
++        if isinstance(asset, dict) and predicate(str(asset.get('name') or '')):
++            return asset
++    raise common.BrowserctlError('No compatible release asset was found.')
++
++
++def _mihomo_asset(release: dict[str, Any]) -> dict[str, Any]:
++    tag = re.escape(str(release.get('tag_name') or ''))
++    machine = platform.machine().lower()
++    if sys.platform == 'win32' and machine in ('amd64', 'x86_64'):
++        pattern = re.compile(
++            rf'^mihomo-windows-amd64-compatible-{tag}\.zip$')
++    elif sys.platform == 'win32' and machine in ('arm64', 'aarch64'):
++        pattern = re.compile(rf'^mihomo-windows-arm64-{tag}\.zip$')
++    else:
++        raise common.BrowserctlError(
++            f'Unsupported platform for automatic Mihomo install: '
++            f'{sys.platform}/{machine}')
++    return _release_asset(release, lambda name: bool(pattern.match(name)))
++
++
++def _dashboard_asset(release: dict[str, Any]) -> dict[str, Any]:
++    return _release_asset(release, lambda name: name == 'compressed-dist.tgz')
++
++
++def _binary_version(binary: Path = MIHOMO_BINARY) -> str:
++    if not binary.exists():
++        return ''
++    completed = subprocess.run(
++        [str(binary), '-v'],
++        cwd=str(MIHOMO_HOME),
++        check=False,
++        capture_output=True,
++        text=True,
++        timeout=30,
++    )
++    output = f'{completed.stdout}\n{completed.stderr}'.strip()
++    if completed.returncode != 0:
++        raise common.BrowserctlError(
++            f'Mihomo version check failed: {output}')
++    match = re.search(r'Mihomo Meta\s+(\S+)', output)
++    version_text = match.group(1) if match else output.splitlines()[0]
++    return version_text.lstrip('vV')
++
++
++def _extract_mihomo(archive: Path, target: Path) -> None:
++    with zipfile.ZipFile(archive) as bundle:
++        candidates = [
++            info for info in bundle.infolist()
++            if not info.is_dir() and info.filename.lower().endswith('.exe')
++        ]
++        if len(candidates) != 1:
++            raise common.BrowserctlError(
++                'Mihomo archive did not contain exactly one executable.')
++        with bundle.open(candidates[0]) as source, open(target, 'wb') as output:
++            shutil.copyfileobj(source, output)
++
++
++def _safe_extract_dashboard(archive: Path, destination: Path) -> None:
++    destination_resolved = destination.resolve()
++    with tarfile.open(archive, mode='r:gz') as bundle:
++        for member in bundle.getmembers():
++            if member.issym() or member.islnk():
++                raise common.BrowserctlError(
++                    'Dashboard archive contains an unsupported link.')
++            target = (destination / member.name).resolve()
++            if (target != destination_resolved and
++                    destination_resolved not in target.parents):
++                raise common.BrowserctlError(
++                    'Dashboard archive contains an unsafe path.')
++        bundle.extractall(destination)
++
++
++def _default_profile(settings: dict[str, Any]) -> dict[str, Any]:
++    return {
++        'mixed-port': settings['mixed_port'],
++        'allow-lan': False,
++        'bind-address': '127.0.0.1',
++        'mode': 'rule',
++        'log-level': 'info',
++        'ipv6': True,
++        'tun': {
++            'enable': False,
++        },
++        'proxies': [],
++        'proxy-groups': [{
++            'name': 'PROXY',
++            'type': 'select',
++            'proxies': ['DIRECT'],
++        }],
++        'rules': ['MATCH,DIRECT'],
++    }
++
++
++def _managed_profile(data: Any,
++                     settings: dict[str, Any]) -> dict[str, Any]:
++    if data is None:
++        data = _default_profile(settings)
++    if not isinstance(data, dict):
++        raise common.BrowserctlError(
++            'Subscription is not a Clash/Mihomo YAML configuration.')
++
++    profile = dict(data)
++    for key in (
++            'port', 'socks-port', 'redir-port', 'tproxy-port',
++            'external-controller', 'external-controller-tls',
++            'external-controller-unix', 'external-controller-pipe',
++            'external-ui', 'external-ui-url', 'secret', 'authentication'):
++        profile.pop(key, None)
++    profile['mixed-port'] = settings['mixed_port']
++    profile['allow-lan'] = False
++    profile['bind-address'] = '127.0.0.1'
++    profile.setdefault('mode', 'rule')
++    profile.setdefault('log-level', 'info')
++
++    tun = profile.get('tun')
++    if isinstance(tun, dict):
++        tun = dict(tun)
++        tun['enable'] = False
++    else:
++        tun = {'enable': False}
++    profile['tun'] = tun
++    return profile
++
++
++def _read_profile_source(source: str) -> tuple[bytes, str]:
++    parsed = urllib.parse.urlparse(source)
++    if parsed.scheme in ('http', 'https'):
++        payload, _ = _request(
++            source,
++            headers={
++                'Accept': 'application/yaml,text/yaml,text/plain,*/*',
++                'User-Agent': 'clash.meta',
++            },
++            timeout=90.0)
++        kind = 'url'
++    else:
++        path = Path(source).expanduser().resolve()
++        if not path.is_file():
++            raise common.BrowserctlError(
++                f'Subscription file not found: {path}')
++        if path.stat().st_size > MAX_PROFILE_BYTES:
++            raise common.BrowserctlError('Subscription file is too large.')
++        payload = path.read_bytes()
++        kind = 'file'
++    if len(payload) > MAX_PROFILE_BYTES:
++        raise common.BrowserctlError('Subscription exceeds the size limit.')
++    return payload, kind
++
++
++def _parse_profile(payload: bytes) -> Any:
++    try:
++        text = payload.decode('utf-8-sig')
++    except UnicodeDecodeError as exc:
++        raise common.BrowserctlError(
++            'Subscription is not valid UTF-8 YAML.') from exc
++    try:
++        return yaml.safe_load(text)
++    except yaml.YAMLError as exc:
++        raise common.BrowserctlError(
++            f'Subscription YAML cannot be parsed: {exc}') from exc
++
++
++def _write_yaml(path: Path, data: dict[str, Any]) -> None:
++    path.write_text(
++        yaml.safe_dump(
++            data,
++            allow_unicode=True,
++            default_flow_style=False,
++            sort_keys=False,
++        ),
++        encoding='utf-8',
++    )
++
++
++def ensure_profile() -> None:
++    ensure_home()
++    if MIHOMO_PROFILE_FILE.exists():
++        return
++    _write_yaml(MIHOMO_PROFILE_FILE, _default_profile(load_settings()))
++
++
++def validate_profile(path: Path,
++                     binary: Path = MIHOMO_BINARY) -> dict[str, Any]:
++    if not binary.exists():
++        raise common.BrowserctlError(
++            'Mihomo is not installed. Run `ccchrome proxy setup` first.')
++    completed = subprocess.run(
++        [str(binary), '-t', '-d', str(MIHOMO_HOME), '-f', str(path)],
++        cwd=str(MIHOMO_HOME),
++        check=False,
++        capture_output=True,
++        text=True,
++        timeout=180,
++    )
++    output = f'{completed.stdout}\n{completed.stderr}'.strip()
++    if completed.returncode != 0:
++        raise common.BrowserctlError(
++            f'Mihomo rejected the configuration: {output}')
++    return {'ok': True, 'output': output}
++
++
++def _load_state() -> dict[str, Any] | None:
++    if not MIHOMO_STATE_FILE.exists():
++        return None
++    try:
++        value = json.loads(MIHOMO_STATE_FILE.read_text(encoding='utf-8'))
++    except (OSError, json.JSONDecodeError):
++        return None
++    return value if isinstance(value, dict) else None
++
++
++def _save_state(state: dict[str, Any]) -> None:
++    ensure_home()
++    MIHOMO_STATE_FILE.write_text(
++        json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
++
++
++def _clear_state() -> None:
++    try:
++        MIHOMO_STATE_FILE.unlink()
++    except FileNotFoundError:
++        pass
++
++
++def _api_url(path: str, settings: dict[str, Any] | None = None) -> str:
++    current = settings or load_settings()
++    if not path.startswith('/'):
++        path = f'/{path}'
++    return f'http://127.0.0.1:{current["controller_port"]}{path}'
++
++
++def api_request(path: str,
++                method: str = 'GET',
++                body: dict[str, Any] | None = None,
++                timeout: float = 10.0) -> Any:
++    settings = load_settings()
++    headers: dict[str, str] = {'User-Agent': USER_AGENT}
++    if settings['secret']:
++        headers['Authorization'] = f'Bearer {settings["secret"]}'
++    payload, _ = _request(
++        _api_url(path, settings),
++        method=method,
++        body=body,
++        headers=headers,
++        timeout=timeout,
++    )
++    if not payload:
++        return None
++    try:
++        return json.loads(payload.decode('utf-8'))
++    except (UnicodeDecodeError, json.JSONDecodeError):
++        return payload.decode('utf-8', errors='replace')
++
++
++def _controller_healthy() -> bool:
++    try:
++        result = api_request('/version', timeout=1.5)
++        return isinstance(result, dict) and bool(result.get('version'))
++    except Exception:
++        return False
++
++
++def _find_managed_pid() -> int:
++    if sys.platform != 'win32' or not MIHOMO_BINARY.exists():
++        return 0
++    expected = str(MIHOMO_BINARY.resolve()).replace("'", "''")
++    script = rf"""
++$process = Get-Process mihomo -ErrorAction SilentlyContinue |
++  Where-Object {{ $_.Path -eq '{expected}' }} |
++  Select-Object -First 1
++if ($process) {{ $process.Id }}
++"""
++    completed = subprocess.run(
++        ['powershell', '-NoProfile', '-Command', script],
++        check=False,
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    try:
++        return int(completed.stdout.strip())
++    except ValueError:
++        return 0
++
++
++def is_running() -> bool:
++    state = _load_state()
++    if (state and common.is_pid_running(state.get('pid')) and
++            _controller_healthy()):
++        return True
++    if not _controller_healthy():
++        return False
++    pid = _find_managed_pid()
++    if not pid:
++        return False
++    settings = load_settings()
++    _save_state({
++        'pid': pid,
++        'started_at': '',
++        'mixed_port': settings['mixed_port'],
++        'controller_port': settings['controller_port'],
++        'binary': str(MIHOMO_BINARY),
++        'adopted': True,
++    })
++    return True
++
++
++def _port_is_open(port: int) -> bool:
++    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
++        sock.settimeout(0.25)
++        return sock.connect_ex(('127.0.0.1', int(port))) == 0
++
++
++def _log_tail(max_lines: int = 20) -> str:
++    if not MIHOMO_LOG_FILE.exists():
++        return ''
++    try:
++        lines = MIHOMO_LOG_FILE.read_text(
++            encoding='utf-8', errors='replace').splitlines()
++    except OSError:
++        return ''
++    return '\n'.join(lines[-max_lines:])
++
++
++def _process_path(pid: int) -> str:
++    if sys.platform != 'win32':
++        return ''
++    script = (
++        f"(Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue).Path")
++    completed = subprocess.run(
++        ['powershell', '-NoProfile', '-Command', script],
++        check=False,
++        capture_output=True,
++        text=True,
++        timeout=10,
++    )
++    return completed.stdout.strip()
++
++
++def stop() -> dict[str, Any]:
++    state = _load_state()
++    if not state and is_running():
++        state = _load_state()
++    if not state:
++        return {'ok': True, 'running': False}
++    pid = int(state.get('pid') or 0)
++    if not common.is_pid_running(pid):
++        _clear_state()
++        return {'ok': True, 'running': False}
++
++    healthy = _controller_healthy()
++    actual_path = _process_path(pid)
++    expected_path = str(MIHOMO_BINARY.resolve())
++    if not healthy and actual_path:
++        if str(Path(actual_path).resolve()).lower() != expected_path.lower():
++            _clear_state()
++            raise common.BrowserctlError(
++                'Refusing to stop a process that is not the managed Mihomo.')
++
++    try:
++        os.kill(pid, signal.SIGTERM)
++    except (OSError, PermissionError) as exc:
++        raise common.BrowserctlError(
++            f'Could not stop Mihomo process {pid}: {exc}') from exc
++
++    deadline = time.time() + 10.0
++    while time.time() < deadline and common.is_pid_running(pid):
++        time.sleep(0.2)
++    if common.is_pid_running(pid):
++        completed = subprocess.run(
++            ['taskkill', '/PID', str(pid), '/T', '/F'],
++            check=False,
++            capture_output=True,
++            text=True,
++            timeout=15,
++        )
++        if completed.returncode != 0 and common.is_pid_running(pid):
++            raise common.BrowserctlError(
++                f'Mihomo process {pid} did not stop: {completed.stderr}')
++    _clear_state()
++    return {'ok': True, 'running': False, 'pid': pid}
++
++
++def _start_command(settings: dict[str, Any]) -> list[str]:
++    command = [
++        str(MIHOMO_BINARY),
++        '-d',
++        str(MIHOMO_HOME),
++        '-f',
++        str(MIHOMO_PROFILE_FILE),
++        '-ext-ctl',
++        f'127.0.0.1:{settings["controller_port"]}',
++        '-secret',
++        settings['secret'],
++    ]
++    if (MIHOMO_UI_DIR / 'index.html').exists():
++        command.extend(['-ext-ui', str(MIHOMO_UI_DIR)])
++    return command
++
++
++def start(schedule_updates: bool = True) -> dict[str, Any]:
++    if is_running():
++        result = status()
++        if schedule_updates:
++            schedule_maintenance()
++        return result
++    if not MIHOMO_BINARY.exists():
++        raise common.BrowserctlError(
++            'Mihomo is not installed. Run `ccchrome proxy setup` first.')
++
++    ensure_profile()
++    validate_profile(MIHOMO_PROFILE_FILE)
++    settings = load_settings()
++    _clear_state()
++    for label, port in (
++            ('mixed proxy', settings['mixed_port']),
++            ('controller', settings['controller_port'])):
++        if _port_is_open(port):
++            raise common.BrowserctlError(
++                f'Mihomo {label} port {port} is already in use.')
++
++    creationflags = 0
++    if sys.platform == 'win32':
++        creationflags |= getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
++        creationflags |= getattr(subprocess, 'CREATE_NO_WINDOW', 0)
++    ensure_home()
++    with open(MIHOMO_LOG_FILE, 'ab') as log_file:
++        process = subprocess.Popen(
++            _start_command(settings),
++            cwd=str(MIHOMO_HOME),
++            stdout=log_file,
++            stderr=log_file,
++            creationflags=creationflags,
++        )
++    state = {
++        'pid': int(process.pid),
++        'started_at': _utc_now(),
++        'mixed_port': settings['mixed_port'],
++        'controller_port': settings['controller_port'],
++        'binary': str(MIHOMO_BINARY),
++    }
++    _save_state(state)
++
++    deadline = time.time() + 60.0
++    while time.time() < deadline:
++        if process.poll() is not None:
++            _clear_state()
++            raise common.BrowserctlError(
++                f'Mihomo exited during startup.\n{_log_tail()}')
++        if _controller_healthy():
++            result = status()
++            if schedule_updates:
++                schedule_maintenance()
++            return result
++        time.sleep(0.25)
++
++    stop()
++    raise common.BrowserctlError(
++        f'Mihomo did not become ready.\n{_log_tail()}')
++
++
++def ensure_running() -> dict[str, Any]:
++    return start(schedule_updates=True)
++
++
++def dashboard_url() -> str:
++    settings = load_settings()
++    return f'http://127.0.0.1:{settings["controller_port"]}/ui/'
++
++
++def _redact_source(source: str) -> str:
++    if not source:
++        return ''
++    parsed = urllib.parse.urlsplit(source)
++    if parsed.scheme not in ('http', 'https'):
++        return str(Path(source).name)
++    host = parsed.hostname or ''
++    port = f':{parsed.port}' if parsed.port else ''
++    return urllib.parse.urlunsplit(
++        (parsed.scheme, f'{host}{port}', parsed.path, '', ''))
++
++
++def status() -> dict[str, Any]:
++    settings = load_settings()
++    running = is_running()
++    state = _load_state()
++    api_version: Any = None
++    runtime_mode = ''
++    if running:
++        try:
++            api_version = api_request('/version', timeout=2.0)
++            runtime_config = api_request('/configs', timeout=2.0)
++            if isinstance(runtime_config, dict):
++                runtime_mode = str(runtime_config.get('mode') or '').lower()
++        except common.BrowserctlError:
++            api_version = None
++    return {
++        'installed': MIHOMO_BINARY.exists(),
++        'running': running,
++        'pid': state.get('pid') if running and state else None,
++        'version': settings['core_version'] or _binary_version(),
++        'api_version': api_version,
++        'mode': runtime_mode,
++        'mixed_port': settings['mixed_port'],
++        'controller_port': settings['controller_port'],
++        'dashboard_installed': (MIHOMO_UI_DIR / 'index.html').exists(),
++        'dashboard_version': settings['dashboard_version'],
++        'dashboard_url': dashboard_url(),
++        'auto_update': settings['auto_update'],
++        'update_interval_hours': settings['update_interval_hours'],
++        'subscription': {
++            'configured': bool(settings['subscription_source']),
++            'source': _redact_source(settings['subscription_source']),
++            'kind': settings['subscription_kind'],
++            'last_update': settings['last_subscription_update'],
++        },
++        'runtime_dir': str(MIHOMO_HOME),
++    }
++
++
++def update_core(force: bool = False) -> dict[str, Any]:
++    ensure_home()
++    release = _request_json(MIHOMO_RELEASE_API, timeout=30.0)
++    tag = str(release.get('tag_name') or '').lstrip('v')
++    if not tag:
++        raise common.BrowserctlError('Latest Mihomo release has no version.')
++    settings = update_settings(last_core_update_check=_utc_now())
++    current = _binary_version() if MIHOMO_BINARY.exists() else ''
++    if current == tag and not force:
++        if settings['core_version'] != tag:
++            update_settings(core_version=tag)
++        return {
++            'ok': True,
++            'updated': False,
++            'version': tag,
++            'message': 'Mihomo is already current.',
++        }
++
++    asset = _mihomo_asset(release)
++    was_running = is_running()
++    with tempfile.TemporaryDirectory(dir=str(MIHOMO_HOME)) as temp_dir_text:
++        temp_dir = Path(temp_dir_text)
++        archive = temp_dir / str(asset['name'])
++        candidate = temp_dir / 'mihomo.exe'
++        _download_asset(asset, archive)
++        _extract_mihomo(archive, candidate)
++        candidate_version = _binary_version(candidate)
++        if candidate_version != tag:
++            raise common.BrowserctlError(
++                f'Downloaded Mihomo version {candidate_version} != {tag}.')
++        if MIHOMO_PROFILE_FILE.exists():
++            validate_profile(MIHOMO_PROFILE_FILE, candidate)
++
++        if was_running:
++            stop()
++        try:
++            if MIHOMO_BACKUP_BINARY.exists():
++                MIHOMO_BACKUP_BINARY.unlink()
++            if MIHOMO_BINARY.exists():
++                MIHOMO_BINARY.replace(MIHOMO_BACKUP_BINARY)
++            candidate.replace(MIHOMO_BINARY)
++            if was_running:
++                start(schedule_updates=False)
++        except Exception as exc:
++            try:
++                if MIHOMO_BINARY.exists():
++                    MIHOMO_BINARY.unlink()
++                if MIHOMO_BACKUP_BINARY.exists():
++                    MIHOMO_BACKUP_BINARY.replace(MIHOMO_BINARY)
++                if was_running and MIHOMO_BINARY.exists():
++                    start(schedule_updates=False)
++            except Exception:
++                pass
++            raise common.BrowserctlError(
++                f'Mihomo update failed and was rolled back: {exc}') from exc
++
++    update_settings(core_version=tag)
++    return {
++        'ok': True,
++        'updated': True,
++        'previous_version': current,
++        'version': tag,
++        'asset': str(asset.get('name') or ''),
++        'restarted': was_running,
++    }
++
++
++def update_dashboard(force: bool = False) -> dict[str, Any]:
++    ensure_home()
++    release = _request_json(DASHBOARD_RELEASE_API, timeout=30.0)
++    tag = str(release.get('tag_name') or '').lstrip('v')
++    if not tag:
++        raise common.BrowserctlError('Latest dashboard release has no version.')
++    settings = update_settings(last_dashboard_update_check=_utc_now())
++    installed = (MIHOMO_UI_DIR / 'index.html').exists()
++    if installed and settings['dashboard_version'] == tag and not force:
++        return {
++            'ok': True,
++            'updated': False,
++            'version': tag,
++            'message': 'MetaCubeXD is already current.',
++        }
++
++    asset = _dashboard_asset(release)
++    with tempfile.TemporaryDirectory(dir=str(MIHOMO_HOME)) as temp_dir_text:
++        temp_dir = Path(temp_dir_text)
++        archive = temp_dir / 'dashboard.tgz'
++        extracted = temp_dir / 'ui'
++        extracted.mkdir()
++        _download_asset(asset, archive)
++        _safe_extract_dashboard(archive, extracted)
++        index_candidates = list(extracted.rglob('index.html'))
++        if len(index_candidates) != 1:
++            raise common.BrowserctlError(
++                'Dashboard archive did not contain one index.html.')
++        dashboard_root = index_candidates[0].parent
++        replacement = MIHOMO_HOME / 'ui.new'
++        if replacement.exists():
++            shutil.rmtree(replacement)
++        shutil.copytree(dashboard_root, replacement)
++        if MIHOMO_UI_DIR.exists():
++            shutil.rmtree(MIHOMO_UI_DIR)
++        replacement.replace(MIHOMO_UI_DIR)
++
++    update_settings(dashboard_version=tag)
++    return {
++        'ok': True,
++        'updated': True,
++        'version': tag,
++        'asset': str(asset.get('name') or ''),
++    }
++
++
++def set_subscription(source: str) -> dict[str, Any]:
++    ensure_home()
++    payload, kind = _read_profile_source(source)
++    parsed = _parse_profile(payload)
++    settings = load_settings()
++    profile = _managed_profile(parsed, settings)
++
++    with tempfile.TemporaryDirectory(dir=str(MIHOMO_HOME)) as temp_dir_text:
++        temp_dir = Path(temp_dir_text)
++        candidate = temp_dir / 'active.yaml'
++        _write_yaml(candidate, profile)
++        validate_profile(candidate)
++        was_running = is_running()
++        if was_running:
++            stop()
++        if MIHOMO_PROFILE_FILE.exists():
++            shutil.copy2(MIHOMO_PROFILE_FILE, MIHOMO_LAST_GOOD_PROFILE)
++        try:
++            MIHOMO_SUBSCRIPTION_FILE.write_bytes(payload)
++            shutil.copy2(candidate, MIHOMO_PROFILE_FILE)
++            if was_running:
++                start(schedule_updates=False)
++        except Exception as exc:
++            if MIHOMO_LAST_GOOD_PROFILE.exists():
++                shutil.copy2(MIHOMO_LAST_GOOD_PROFILE, MIHOMO_PROFILE_FILE)
++            if was_running:
++                try:
++                    start(schedule_updates=False)
++                except Exception:
++                    pass
++            raise common.BrowserctlError(
++                f'Subscription could not be applied and was rolled back: '
++                f'{exc}') from exc
++
++    update_settings(
++        subscription_source=source,
++        subscription_kind=kind,
++        last_subscription_update=_utc_now(),
++    )
++    return {
++        'ok': True,
++        'source': _redact_source(source),
++        'kind': kind,
++        'restarted': was_running,
++        'profile': str(MIHOMO_PROFILE_FILE),
++    }
++
++
++def refresh_subscription() -> dict[str, Any]:
++    settings = load_settings()
++    source = settings['subscription_source']
++    if not source:
++        raise common.BrowserctlError('No subscription has been configured.')
++    if settings['subscription_kind'] != 'url':
++        raise common.BrowserctlError(
++            'The active profile came from a local file and cannot auto-update.')
++    return set_subscription(source)
++
++
++def clear_subscription() -> dict[str, Any]:
++    ensure_home()
++    was_running = is_running()
++    if was_running:
++        stop()
++    settings = update_settings(
++        subscription_source='',
++        subscription_kind='',
++        last_subscription_update='',
++    )
++    if MIHOMO_PROFILE_FILE.exists():
++        shutil.copy2(MIHOMO_PROFILE_FILE, MIHOMO_LAST_GOOD_PROFILE)
++    _write_yaml(MIHOMO_PROFILE_FILE, _default_profile(settings))
++    try:
++        MIHOMO_SUBSCRIPTION_FILE.unlink()
++    except FileNotFoundError:
++        pass
++    validate_profile(MIHOMO_PROFILE_FILE)
++    if was_running:
++        start(schedule_updates=False)
++    return {
++        'ok': True,
++        'configured': False,
++        'restarted': was_running,
++    }
++
++
++def set_ports(mixed_port: int, controller_port: int) -> dict[str, Any]:
++    candidate_settings = load_settings()
++    candidate_settings.update({
++        'mixed_port': mixed_port,
++        'controller_port': controller_port,
++    })
++    candidate_settings = normalize_settings(candidate_settings)
++    if (candidate_settings['mixed_port'] ==
++            candidate_settings['controller_port']):
++        raise common.BrowserctlError(
++            'Mixed proxy and controller ports must be different.')
++    was_running = is_running()
++    if was_running:
++        stop()
++    settings = save_settings(candidate_settings)
++    if MIHOMO_SUBSCRIPTION_FILE.exists():
++        parsed = _parse_profile(MIHOMO_SUBSCRIPTION_FILE.read_bytes())
++        _write_yaml(MIHOMO_PROFILE_FILE,
++                    _managed_profile(parsed, settings))
++    else:
++        _write_yaml(MIHOMO_PROFILE_FILE, _default_profile(settings))
++    validate_profile(MIHOMO_PROFILE_FILE)
++    if was_running:
++        start(schedule_updates=False)
++    return {
++        'ok': True,
++        'mixed_port': settings['mixed_port'],
++        'controller_port': settings['controller_port'],
++        'restarted': was_running,
++    }
++
++
++def set_auto_update(enabled: bool,
++                    interval_hours: int | None = None) -> dict[str, Any]:
++    changes: dict[str, Any] = {'auto_update': enabled}
++    if interval_hours is not None:
++        changes['update_interval_hours'] = interval_hours
++        changes['subscription_update_interval_hours'] = interval_hours
++    settings = update_settings(**changes)
++    return {
++        'ok': True,
++        'auto_update': settings['auto_update'],
++        'interval_hours': settings['update_interval_hours'],
++    }
++
++
++def set_mode(mode: str) -> dict[str, Any]:
++    normalized = mode.lower()
++    if normalized not in ('rule', 'global', 'direct'):
++        raise common.BrowserctlError('Mode must be rule, global, or direct.')
++    ensure_running()
++    api_request('/configs', method='PATCH', body={'mode': normalized})
++    return {'ok': True, 'mode': normalized}
++
++
++def list_proxies() -> dict[str, Any]:
++    ensure_running()
++    payload = api_request('/proxies')
++    proxies = payload.get('proxies', {}) if isinstance(payload, dict) else {}
++    groups = []
++    for name, value in proxies.items():
++        if not isinstance(value, dict) or not isinstance(value.get('all'), list):
++            continue
++        groups.append({
++            'name': name,
++            'type': value.get('type'),
++            'now': value.get('now'),
++            'all': value.get('all'),
++        })
++    return {'groups': groups, 'count': len(groups)}
++
++
++def select_proxy(group: str, name: str) -> dict[str, Any]:
++    ensure_running()
++    path = f'/proxies/{urllib.parse.quote(group, safe="")}'
++    api_request(path, method='PUT', body={'name': name})
++    return {'ok': True, 'group': group, 'selected': name}
++
++
++def test_proxy(name: str,
++               test_url: str = 'https://www.gstatic.com/generate_204',
++               timeout_ms: int = 5000) -> dict[str, Any]:
++    ensure_running()
++    query = urllib.parse.urlencode({
++        'url': test_url,
++        'timeout': max(1000, int(timeout_ms)),
++    })
++    path = f'/proxies/{urllib.parse.quote(name, safe="")}/delay?{query}'
++    result = api_request(path, timeout=max(10.0, timeout_ms / 1000 + 5))
++    return {'name': name, 'result': result}
++
++
++def setup(source: str = '') -> dict[str, Any]:
++    core = update_core()
++    dashboard = update_dashboard()
++    if source:
++        subscription = set_subscription(source)
++    else:
++        ensure_profile()
++        validate_profile(MIHOMO_PROFILE_FILE)
++        subscription = {
++            'ok': True,
++            'configured': bool(load_settings()['subscription_source']),
++        }
++    runtime = start(schedule_updates=False)
++    return {
++        'ok': True,
++        'core': core,
++        'dashboard': dashboard,
++        'subscription': subscription,
++        'runtime': runtime,
++    }
++
++
++class _MaintenanceLock:
++    def __enter__(self) -> '_MaintenanceLock':
++        ensure_home()
++        if MIHOMO_LOCK_FILE.exists():
++            age = time.time() - MIHOMO_LOCK_FILE.stat().st_mtime
++            if age < 30 * 60:
++                raise common.BrowserctlError('Maintenance is already running.')
++            MIHOMO_LOCK_FILE.unlink()
++        try:
++            descriptor = os.open(
++                MIHOMO_LOCK_FILE,
++                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
++            )
++        except FileExistsError as exc:
++            raise common.BrowserctlError(
++                'Maintenance is already running.') from exc
++        with os.fdopen(descriptor, 'w', encoding='utf-8') as lock_file:
++            lock_file.write(f'{os.getpid()}\n{_utc_now()}\n')
++        return self
++
++    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
++        try:
++            MIHOMO_LOCK_FILE.unlink()
++        except FileNotFoundError:
++            pass
++
++
++def maintain() -> dict[str, Any]:
++    results: dict[str, Any] = {'ok': True}
++    with _MaintenanceLock():
++        settings = load_settings()
++        if not settings['auto_update']:
++            return {'ok': True, 'skipped': 'auto update is disabled'}
++        if (settings['subscription_source'] and
++                settings['subscription_kind'] == 'url' and
++                _is_due(
++                    settings['last_subscription_update'],
++                    settings['subscription_update_interval_hours'])):
++            results['subscription'] = refresh_subscription()
++        settings = load_settings()
++        if _is_due(settings['last_core_update_check'],
++                   settings['update_interval_hours']):
++            results['core'] = update_core()
++        settings = load_settings()
++        if _is_due(settings['last_dashboard_update_check'],
++                   settings['update_interval_hours']):
++            results['dashboard'] = update_dashboard()
++    return results
++
++
++def schedule_maintenance() -> None:
++    settings = load_settings()
++    if not settings['auto_update']:
++        return
++    due = _is_due(settings['last_core_update_check'],
++                  settings['update_interval_hours'])
++    due = due or _is_due(settings['last_dashboard_update_check'],
++                        settings['update_interval_hours'])
++    if (settings['subscription_source'] and
++            settings['subscription_kind'] == 'url'):
++        due = due or _is_due(
++            settings['last_subscription_update'],
++            settings['subscription_update_interval_hours'])
++    if not due or MIHOMO_LOCK_FILE.exists():
++        return
++    creationflags = 0
++    if sys.platform == 'win32':
++        creationflags |= getattr(subprocess, 'CREATE_NO_WINDOW', 0)
++        creationflags |= getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
++    with open(MIHOMO_LOG_FILE, 'ab') as log_file:
++        subprocess.Popen(
++            [sys.executable, str(Path(__file__).resolve()), 'maintain'],
++            cwd=str(common.REPO_ROOT),
++            stdout=log_file,
++            stderr=log_file,
++            creationflags=creationflags,
++        )
++
++
++def _main() -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument('command', choices=('maintain',))
++    args = parser.parse_args()
++    try:
++        if args.command == 'maintain':
++            print(json.dumps(maintain(), ensure_ascii=False))
++        return 0
++    except common.BrowserctlError as exc:
++        print(json.dumps({'error': str(exc)}, ensure_ascii=False))
++        return 1
++
++
++if __name__ == '__main__':
++    raise SystemExit(_main())
+diff --git a/tools/browserctl/mihomo_unittest.py b/tools/browserctl/mihomo_unittest.py
+new file mode 100644
+index 0000000000..a7d1bba6fe
+--- /dev/null
++++ b/tools/browserctl/mihomo_unittest.py
+@@ -0,0 +1,120 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++
++from __future__ import annotations
++
++import os
++import sys
++import unittest
++from pathlib import Path
++from unittest import mock
++
++SCRIPT_DIR = Path(__file__).resolve().parent
++sys.path.insert(0, str(SCRIPT_DIR))
++
++import common
++import mihomo
++
++
++class MihomoSettingsTest(unittest.TestCase):
++    def test_normalize_settings_repairs_invalid_values(self) -> None:
++        settings = mihomo.normalize_settings({
++            'mixed_port': 'bad',
++            'controller_port': 70000,
++            'update_interval_hours': 0,
++            'auto_update': False,
++        })
++        self.assertEqual(7890, settings['mixed_port'])
++        self.assertEqual(65535, settings['controller_port'])
++        self.assertEqual(1, settings['update_interval_hours'])
++        self.assertFalse(settings['auto_update'])
++
++    def test_current_process_is_running(self) -> None:
++        self.assertTrue(common.is_pid_running(os.getpid()))
++
++
++class MihomoProfileTest(unittest.TestCase):
++    def test_managed_profile_forces_browser_only_listeners(self) -> None:
++        profile = mihomo._managed_profile(  # pylint: disable=protected-access
++            {
++                'port': 8080,
++                'socks-port': 1080,
++                'mixed-port': 4567,
++                'allow-lan': True,
++                'bind-address': '*',
++                'external-controller': '0.0.0.0:9999',
++                'secret': 'remote-secret',
++                'authentication': ['user:password'],
++                'tun': {
++                    'enable': True,
++                    'stack': 'mixed',
++                },
++                'proxies': [{
++                    'name': 'sample',
++                    'type': 'socks5',
++                    'server': '127.0.0.1',
++                    'port': 1080,
++                }],
++                'rules': ['MATCH,DIRECT'],
++            },
++            mihomo.normalize_settings({
++                'mixed_port': 17890,
++                'controller_port': 19090,
++            }))
++        self.assertEqual(17890, profile['mixed-port'])
++        self.assertFalse(profile['allow-lan'])
++        self.assertEqual('127.0.0.1', profile['bind-address'])
++        self.assertFalse(profile['tun']['enable'])
++        self.assertEqual('mixed', profile['tun']['stack'])
++        self.assertNotIn('port', profile)
++        self.assertNotIn('socks-port', profile)
++        self.assertNotIn('external-controller', profile)
++        self.assertNotIn('secret', profile)
++        self.assertNotIn('authentication', profile)
++        self.assertEqual('sample', profile['proxies'][0]['name'])
++
++    def test_non_mapping_subscription_is_rejected(self) -> None:
++        with self.assertRaises(common.BrowserctlError):
++            mihomo._managed_profile(  # pylint: disable=protected-access
++                ['ss://example'], mihomo.normalize_settings(None))
++
++    def test_subscription_url_is_redacted(self) -> None:
++        source = 'https://example.com/api/sub?token=private#fragment'
++        self.assertEqual(
++            'https://example.com/api/sub',
++            mihomo._redact_source(source))  # pylint: disable=protected-access
++
++
++class MihomoReleaseTest(unittest.TestCase):
++    def test_selects_compatible_windows_amd64_asset(self) -> None:
++        release = {
++            'tag_name': 'v1.2.3',
++            'assets': [
++                {'name': 'mihomo-windows-amd64-v3-v1.2.3.zip'},
++                {'name': 'mihomo-windows-amd64-compatible-v1.2.3.zip'},
++            ],
++        }
++        with mock.patch.object(mihomo.sys, 'platform', 'win32'), \
++                mock.patch.object(mihomo.platform, 'machine',
++                                  return_value='AMD64'):
++            asset = mihomo._mihomo_asset(  # pylint: disable=protected-access
++                release)
++        self.assertEqual(
++            'mihomo-windows-amd64-compatible-v1.2.3.zip', asset['name'])
++
++    def test_selects_static_dashboard_bundle(self) -> None:
++        release = {
++            'assets': [
++                {'name': 'MetaCubeXD-win-x64.exe'},
++                {'name': 'compressed-dist.tgz'},
++            ],
++        }
++        asset = mihomo._dashboard_asset(  # pylint: disable=protected-access
++            release)
++        self.assertEqual('compressed-dist.tgz', asset['name'])
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff --git a/tools/browserctl/proxy_dashboard.html b/tools/browserctl/proxy_dashboard.html
+new file mode 100644
+index 0000000000..687553d391
+--- /dev/null
++++ b/tools/browserctl/proxy_dashboard.html
+@@ -0,0 +1,931 @@
++<!doctype html>
++<html lang="zh-CN">
++<head>
++  <meta charset="utf-8">
++  <meta name="viewport" content="width=device-width, initial-scale=1">
++  <meta http-equiv="Content-Security-Policy"
++        content="default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'self'">
++  <title>CCCrome 代理</title>
++  <style>
++    :root {
++      color-scheme: dark;
++      --bg: #101418;
++      --surface: #171d22;
++      --surface-2: #1d252b;
++      --line: #303a41;
++      --text: #eef3f5;
++      --muted: #9aa9b2;
++      --cyan: #62c8d8;
++      --green: #78c995;
++      --amber: #e2b86f;
++      --red: #df7b82;
++      --focus: #90d9e4;
++    }
++
++    * {
++      box-sizing: border-box;
++    }
++
++    html,
++    body {
++      min-height: 100%;
++      margin: 0;
++      background: var(--bg);
++      color: var(--text);
++      font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
++      font-size: 14px;
++      letter-spacing: 0;
++    }
++
++    button,
++    input,
++    select {
++      font: inherit;
++      letter-spacing: 0;
++    }
++
++    button,
++    .button-link {
++      min-height: 36px;
++      border: 1px solid var(--line);
++      border-radius: 6px;
++      background: var(--surface-2);
++      color: var(--text);
++      padding: 0 14px;
++      cursor: pointer;
++      text-decoration: none;
++      display: inline-flex;
++      align-items: center;
++      justify-content: center;
++      white-space: nowrap;
++    }
++
++    button:hover,
++    .button-link:hover {
++      border-color: #52616a;
++      background: #263038;
++    }
++
++    button:focus-visible,
++    input:focus-visible,
++    select:focus-visible,
++    .button-link:focus-visible {
++      outline: 2px solid var(--focus);
++      outline-offset: 2px;
++    }
++
++    button:disabled {
++      cursor: wait;
++      opacity: 0.55;
++    }
++
++    button.primary {
++      border-color: #3a7f89;
++      background: #245d66;
++    }
++
++    button.danger {
++      color: #ffd9dc;
++    }
++
++    input[type="text"],
++    input[type="url"],
++    input[type="number"],
++    select {
++      height: 38px;
++      min-width: 0;
++      border: 1px solid var(--line);
++      border-radius: 6px;
++      background: #0d1114;
++      color: var(--text);
++      padding: 0 11px;
++    }
++
++    input::placeholder {
++      color: #71808a;
++    }
++
++    header.app-header {
++      min-height: 64px;
++      border-bottom: 1px solid var(--line);
++      background: #12171b;
++    }
++
++    .header-inner,
++    main {
++      width: min(1180px, calc(100% - 32px));
++      margin: 0 auto;
++    }
++
++    .header-inner {
++      min-height: 64px;
++      display: flex;
++      align-items: center;
++      gap: 18px;
++    }
++
++    .brand {
++      font-size: 18px;
++      font-weight: 650;
++      flex: 1;
++    }
++
++    .status-inline {
++      display: flex;
++      align-items: center;
++      gap: 8px;
++      color: var(--muted);
++    }
++
++    .status-dot {
++      width: 9px;
++      height: 9px;
++      border-radius: 50%;
++      background: var(--red);
++      flex: none;
++    }
++
++    .status-dot.running {
++      background: var(--green);
++    }
++
++    main {
++      padding: 24px 0 48px;
++    }
++
++    .summary {
++      min-height: 58px;
++      display: grid;
++      grid-template-columns: repeat(4, minmax(0, 1fr));
++      border: 1px solid var(--line);
++      border-radius: 6px;
++      background: var(--surface);
++      overflow: hidden;
++    }
++
++    .summary-item {
++      padding: 11px 14px;
++      border-right: 1px solid var(--line);
++      min-width: 0;
++    }
++
++    .summary-item:last-child {
++      border-right: 0;
++    }
++
++    .summary-label {
++      display: block;
++      color: var(--muted);
++      font-size: 12px;
++      margin-bottom: 4px;
++    }
++
++    .summary-value {
++      display: block;
++      overflow: hidden;
++      text-overflow: ellipsis;
++      white-space: nowrap;
++      font-weight: 600;
++    }
++
++    section {
++      padding: 24px 0;
++      border-bottom: 1px solid var(--line);
++    }
++
++    section:last-child {
++      border-bottom: 0;
++    }
++
++    .section-head {
++      min-height: 38px;
++      display: flex;
++      align-items: center;
++      justify-content: space-between;
++      gap: 16px;
++      margin-bottom: 14px;
++    }
++
++    h2 {
++      margin: 0;
++      font-size: 16px;
++      line-height: 1.3;
++      font-weight: 650;
++    }
++
++    .muted {
++      color: var(--muted);
++    }
++
++    .split {
++      display: grid;
++      grid-template-columns: minmax(0, 1.45fr) minmax(300px, 0.75fr);
++      gap: 32px;
++    }
++
++    .subscription-form {
++      display: grid;
++      grid-template-columns: minmax(0, 1fr) auto;
++      gap: 10px;
++    }
++
++    .subscription-meta {
++      display: flex;
++      gap: 16px;
++      margin-top: 11px;
++      min-width: 0;
++      color: var(--muted);
++    }
++
++    .subscription-meta span {
++      overflow: hidden;
++      text-overflow: ellipsis;
++      white-space: nowrap;
++    }
++
++    .actions {
++      display: flex;
++      flex-wrap: wrap;
++      gap: 8px;
++      margin-top: 14px;
++    }
++
++    .update-row {
++      display: grid;
++      grid-template-columns: minmax(0, 1fr) 88px;
++      gap: 10px;
++      align-items: center;
++      margin-bottom: 14px;
++    }
++
++    .switch-row {
++      display: flex;
++      align-items: center;
++      justify-content: space-between;
++      gap: 14px;
++      min-height: 38px;
++    }
++
++    .switch {
++      width: 42px;
++      height: 24px;
++      position: relative;
++      flex: none;
++    }
++
++    .switch input {
++      position: absolute;
++      opacity: 0;
++      pointer-events: none;
++    }
++
++    .switch-track {
++      position: absolute;
++      inset: 0;
++      border: 1px solid var(--line);
++      border-radius: 12px;
++      background: #313a40;
++      cursor: pointer;
++    }
++
++    .switch-track::after {
++      content: "";
++      position: absolute;
++      width: 16px;
++      height: 16px;
++      left: 3px;
++      top: 3px;
++      border-radius: 50%;
++      background: #d7e0e4;
++      transition: transform 140ms ease, background 140ms ease;
++    }
++
++    .switch input:checked + .switch-track {
++      background: #245d66;
++      border-color: #3a7f89;
++    }
++
++    .switch input:checked + .switch-track::after {
++      transform: translateX(18px);
++      background: #dffaff;
++    }
++
++    .segmented {
++      display: inline-grid;
++      grid-template-columns: repeat(3, 1fr);
++      border: 1px solid var(--line);
++      border-radius: 6px;
++      overflow: hidden;
++      min-width: 270px;
++    }
++
++    .segmented button {
++      border: 0;
++      border-right: 1px solid var(--line);
++      border-radius: 0;
++      min-height: 34px;
++      background: transparent;
++    }
++
++    .segmented button:last-child {
++      border-right: 0;
++    }
++
++    .segmented button.active {
++      background: #245d66;
++      color: #e8fbff;
++    }
++
++    .groups {
++      display: grid;
++      grid-template-columns: repeat(2, minmax(0, 1fr));
++      gap: 12px;
++    }
++
++    .group {
++      min-height: 118px;
++      border: 1px solid var(--line);
++      border-radius: 6px;
++      background: var(--surface);
++      padding: 14px;
++    }
++
++    .group-head {
++      display: flex;
++      align-items: center;
++      justify-content: space-between;
++      gap: 10px;
++      margin-bottom: 12px;
++    }
++
++    .group-name {
++      font-weight: 650;
++      overflow: hidden;
++      text-overflow: ellipsis;
++      white-space: nowrap;
++    }
++
++    .group-type {
++      color: var(--muted);
++      font-size: 12px;
++      flex: none;
++    }
++
++    .group-controls {
++      display: grid;
++      grid-template-columns: minmax(0, 1fr) auto auto;
++      gap: 8px;
++    }
++
++    .group-result {
++      min-height: 20px;
++      margin-top: 8px;
++      color: var(--muted);
++      font-size: 12px;
++    }
++
++    .empty {
++      min-height: 110px;
++      border: 1px dashed var(--line);
++      border-radius: 6px;
++      display: flex;
++      align-items: center;
++      justify-content: center;
++      color: var(--muted);
++    }
++
++    .toast {
++      position: fixed;
++      right: 20px;
++      bottom: 20px;
++      max-width: min(420px, calc(100% - 40px));
++      border: 1px solid var(--line);
++      border-radius: 6px;
++      background: #20282e;
++      color: var(--text);
++      padding: 11px 14px;
++      box-shadow: 0 10px 28px rgb(0 0 0 / 35%);
++      opacity: 0;
++      transform: translateY(8px);
++      pointer-events: none;
++      transition: opacity 140ms ease, transform 140ms ease;
++    }
++
++    .toast.show {
++      opacity: 1;
++      transform: translateY(0);
++    }
++
++    .toast.error {
++      border-color: #7e454a;
++      color: #ffd9dc;
++    }
++
++    @media (max-width: 820px) {
++      .header-inner,
++      main {
++        width: min(100% - 20px, 680px);
++      }
++
++      .header-inner {
++        flex-wrap: wrap;
++        padding: 10px 0;
++      }
++
++      .brand {
++        min-width: calc(100% - 150px);
++      }
++
++      .summary {
++        grid-template-columns: repeat(2, minmax(0, 1fr));
++      }
++
++      .summary-item:nth-child(2) {
++        border-right: 0;
++      }
++
++      .summary-item:nth-child(-n + 2) {
++        border-bottom: 1px solid var(--line);
++      }
++
++      .split,
++      .groups {
++        grid-template-columns: 1fr;
++      }
++
++      .section-head {
++        align-items: flex-start;
++        flex-direction: column;
++      }
++
++      .segmented {
++        width: 100%;
++        min-width: 0;
++      }
++    }
++
++    @media (max-width: 520px) {
++      .status-inline {
++        order: 3;
++        width: 100%;
++      }
++
++      .subscription-form,
++      .group-controls {
++        grid-template-columns: 1fr;
++      }
++
++      .subscription-meta {
++        flex-direction: column;
++        gap: 4px;
++      }
++
++      .summary {
++        grid-template-columns: 1fr;
++      }
++
++      .summary-item {
++        border-right: 0;
++        border-bottom: 1px solid var(--line);
++      }
++
++      .summary-item:last-child {
++        border-bottom: 0;
++      }
++    }
++  </style>
++</head>
++<body>
++  <header class="app-header">
++    <div class="header-inner">
++      <div class="brand">CCCrome 代理</div>
++      <div class="status-inline">
++        <span id="statusDot" class="status-dot"></span>
++        <span id="statusText">正在连接</span>
++      </div>
++      <a id="advancedLink" class="button-link" href="#" target="_blank"
++         rel="noopener noreferrer" referrerpolicy="no-referrer">高级面板</a>
++    </div>
++  </header>
++
++  <main>
++    <div class="summary" aria-label="运行状态">
++      <div class="summary-item">
++        <span class="summary-label">内核</span>
++        <span id="coreVersion" class="summary-value">-</span>
++      </div>
++      <div class="summary-item">
++        <span class="summary-label">面板</span>
++        <span id="dashboardVersion" class="summary-value">-</span>
++      </div>
++      <div class="summary-item">
++        <span class="summary-label">代理端口</span>
++        <span id="mixedPort" class="summary-value">-</span>
++      </div>
++      <div class="summary-item">
++        <span class="summary-label">控制端口</span>
++        <span id="controllerPort" class="summary-value">-</span>
++      </div>
++    </div>
++
++    <section class="split">
++      <div>
++        <div class="section-head">
++          <h2>订阅</h2>
++        </div>
++        <form id="subscriptionForm" class="subscription-form">
++          <input id="subscriptionSource" type="text"
++                 placeholder="Clash/Mihomo 订阅链接或本地 YAML 路径"
++                 autocomplete="off" spellcheck="false">
++          <button id="importButton" class="primary" type="submit">导入</button>
++        </form>
++        <div class="subscription-meta">
++          <span id="subscriptionState">未导入</span>
++          <span id="subscriptionUpdated"></span>
++        </div>
++        <div class="actions">
++          <button id="refreshButton" type="button">更新订阅</button>
++          <button id="clearButton" class="danger" type="button">清除订阅</button>
++        </div>
++      </div>
++
++      <div>
++        <div class="section-head">
++          <h2>更新</h2>
++          <button id="updateCoreButton" type="button">立即检查</button>
++        </div>
++        <div class="update-row">
++          <label for="intervalHours" class="muted">检查间隔（小时）</label>
++          <input id="intervalHours" type="number" min="1" max="720" value="24">
++        </div>
++        <div class="switch-row">
++          <span>自动更新</span>
++          <label class="switch">
++            <input id="autoUpdate" type="checkbox">
++            <span class="switch-track"></span>
++          </label>
++        </div>
++      </div>
++    </section>
++
++    <section>
++      <div class="section-head">
++        <h2>代理模式</h2>
++        <div id="modeControl" class="segmented" role="group" aria-label="代理模式">
++          <button type="button" data-mode="rule">规则</button>
++          <button type="button" data-mode="global">全局</button>
++          <button type="button" data-mode="direct">直连</button>
++        </div>
++      </div>
++    </section>
++
++    <section>
++      <div class="section-head">
++        <h2>节点</h2>
++        <button id="reloadNodesButton" type="button">刷新列表</button>
++      </div>
++      <div id="groups" class="groups">
++        <div class="empty">正在读取节点</div>
++      </div>
++    </section>
++  </main>
++
++  <div id="toast" class="toast" role="status" aria-live="polite"></div>
++
++  <script>
++    'use strict';
++
++    const token = new URLSearchParams(location.search).get('token') || '';
++    const state = { status: null, groups: [] };
++    let toastTimer = 0;
++
++    const elements = {
++      statusDot: document.querySelector('#statusDot'),
++      statusText: document.querySelector('#statusText'),
++      coreVersion: document.querySelector('#coreVersion'),
++      dashboardVersion: document.querySelector('#dashboardVersion'),
++      mixedPort: document.querySelector('#mixedPort'),
++      controllerPort: document.querySelector('#controllerPort'),
++      advancedLink: document.querySelector('#advancedLink'),
++      subscriptionForm: document.querySelector('#subscriptionForm'),
++      subscriptionSource: document.querySelector('#subscriptionSource'),
++      subscriptionState: document.querySelector('#subscriptionState'),
++      subscriptionUpdated: document.querySelector('#subscriptionUpdated'),
++      importButton: document.querySelector('#importButton'),
++      refreshButton: document.querySelector('#refreshButton'),
++      clearButton: document.querySelector('#clearButton'),
++      updateCoreButton: document.querySelector('#updateCoreButton'),
++      intervalHours: document.querySelector('#intervalHours'),
++      autoUpdate: document.querySelector('#autoUpdate'),
++      modeControl: document.querySelector('#modeControl'),
++      groups: document.querySelector('#groups'),
++      reloadNodesButton: document.querySelector('#reloadNodesButton'),
++      toast: document.querySelector('#toast'),
++    };
++
++    async function api(path, options = {}) {
++      const response = await fetch(`/proxy/api/${path}`, {
++        ...options,
++        headers: {
++          'Content-Type': 'application/json',
++          'X-Browserctl-Token': token,
++          ...(options.headers || {}),
++        },
++      });
++      const payload = await response.json();
++      if (!response.ok || payload.error) {
++        throw new Error(payload.error || `请求失败：${response.status}`);
++      }
++      return payload;
++    }
++
++    function notify(message, isError = false) {
++      window.clearTimeout(toastTimer);
++      elements.toast.textContent = message;
++      elements.toast.classList.toggle('error', isError);
++      elements.toast.classList.add('show');
++      toastTimer = window.setTimeout(() => {
++        elements.toast.classList.remove('show');
++      }, 4200);
++    }
++
++    async function busy(button, label, task) {
++      const previous = button.textContent;
++      button.disabled = true;
++      button.textContent = label;
++      try {
++        return await task();
++      } finally {
++        button.disabled = false;
++        button.textContent = previous;
++      }
++    }
++
++    function formatTime(value) {
++      if (!value) return '';
++      const date = new Date(value);
++      if (Number.isNaN(date.getTime())) return value;
++      return date.toLocaleString('zh-CN', { hour12: false });
++    }
++
++    function renderStatus(status) {
++      state.status = status;
++      elements.statusDot.classList.toggle('running', Boolean(status.running));
++      elements.statusText.textContent = status.running ? '内核运行中' : '内核已停止';
++      elements.coreVersion.textContent = status.version || '未安装';
++      elements.dashboardVersion.textContent = status.dashboard_version || '未安装';
++      elements.mixedPort.textContent = String(status.mixed_port || '-');
++      elements.controllerPort.textContent = String(status.controller_port || '-');
++      elements.advancedLink.href = status.dashboard_url || '#';
++      elements.autoUpdate.checked = Boolean(status.auto_update);
++      elements.intervalHours.value = String(status.update_interval_hours || 24);
++
++      const subscription = status.subscription || {};
++      elements.subscriptionState.textContent = subscription.configured
++        ? subscription.source || '已导入'
++        : '未导入';
++      elements.subscriptionUpdated.textContent = subscription.last_update
++        ? `更新于 ${formatTime(subscription.last_update)}`
++        : '';
++      elements.refreshButton.disabled = subscription.kind !== 'url';
++      elements.clearButton.disabled = !subscription.configured;
++
++      for (const button of elements.modeControl.querySelectorAll('button')) {
++        button.classList.toggle('active', button.dataset.mode === status.mode);
++      }
++    }
++
++    function nodeOption(name, selected) {
++      const option = document.createElement('option');
++      option.value = name;
++      option.textContent = name;
++      option.selected = name === selected;
++      return option;
++    }
++
++    function renderGroups(payload) {
++      state.groups = payload.groups || [];
++      elements.groups.replaceChildren();
++      if (!state.groups.length) {
++        const empty = document.createElement('div');
++        empty.className = 'empty';
++        empty.textContent = '没有可选择的代理组';
++        elements.groups.append(empty);
++        return;
++      }
++
++      for (const group of state.groups) {
++        const container = document.createElement('article');
++        container.className = 'group';
++
++        const head = document.createElement('div');
++        head.className = 'group-head';
++        const name = document.createElement('span');
++        name.className = 'group-name';
++        name.textContent = group.name;
++        name.title = group.name;
++        const type = document.createElement('span');
++        type.className = 'group-type';
++        type.textContent = group.type || '';
++        head.append(name, type);
++
++        const controls = document.createElement('div');
++        controls.className = 'group-controls';
++        const select = document.createElement('select');
++        select.setAttribute('aria-label', `${group.name} 节点`);
++        for (const item of group.all || []) {
++          select.append(nodeOption(item, group.now));
++        }
++        const apply = document.createElement('button');
++        apply.type = 'button';
++        apply.textContent = '选择';
++        apply.disabled = String(group.type || '').toLowerCase() !== 'selector';
++        const test = document.createElement('button');
++        test.type = 'button';
++        test.textContent = '测速';
++        controls.append(select, apply, test);
++
++        const result = document.createElement('div');
++        result.className = 'group-result';
++        result.textContent = group.now ? `当前：${group.now}` : '';
++
++        apply.addEventListener('click', async () => {
++          await busy(apply, '应用中', async () => {
++            try {
++              await api('select', {
++                method: 'POST',
++                body: JSON.stringify({ group: group.name, node: select.value }),
++              });
++              result.textContent = `当前：${select.value}`;
++              notify(`已切换到 ${select.value}`);
++            } catch (error) {
++              notify(error.message, true);
++            }
++          });
++        });
++
++        test.addEventListener('click', async () => {
++          await busy(test, '测速中', async () => {
++            try {
++              const response = await api('test', {
++                method: 'POST',
++                body: JSON.stringify({ node: select.value, timeout: 5000 }),
++              });
++              const delay = response.result && response.result.delay;
++              result.textContent = Number.isFinite(delay)
++                ? `${select.value}：${delay} ms`
++                : `${select.value}：无响应`;
++            } catch (error) {
++              result.textContent = `${select.value}：测速失败`;
++              notify(error.message, true);
++            }
++          });
++        });
++
++        container.append(head, controls, result);
++        elements.groups.append(container);
++      }
++    }
++
++    async function reload() {
++      try {
++        const [status, groups] = await Promise.all([
++          api('status'),
++          api('nodes'),
++        ]);
++        renderStatus(status);
++        renderGroups(groups);
++      } catch (error) {
++        notify(error.message, true);
++      }
++    }
++
++    elements.subscriptionForm.addEventListener('submit', async event => {
++      event.preventDefault();
++      const source = elements.subscriptionSource.value.trim();
++      if (!source) {
++        notify('请输入订阅链接或 YAML 路径', true);
++        return;
++      }
++      await busy(elements.importButton, '导入中', async () => {
++        try {
++          await api('subscription/set', {
++            method: 'POST',
++            body: JSON.stringify({ source }),
++          });
++          elements.subscriptionSource.value = '';
++          notify('订阅已导入');
++          await reload();
++        } catch (error) {
++          notify(error.message, true);
++        }
++      });
++    });
++
++    elements.refreshButton.addEventListener('click', async () => {
++      await busy(elements.refreshButton, '更新中', async () => {
++        try {
++          await api('subscription/update', { method: 'POST', body: '{}' });
++          notify('订阅已更新');
++          await reload();
++        } catch (error) {
++          notify(error.message, true);
++        }
++      });
++    });
++
++    elements.clearButton.addEventListener('click', async () => {
++      await busy(elements.clearButton, '清除中', async () => {
++        try {
++          await api('subscription/clear', { method: 'POST', body: '{}' });
++          notify('订阅已清除');
++          await reload();
++        } catch (error) {
++          notify(error.message, true);
++        }
++      });
++    });
++
++    elements.updateCoreButton.addEventListener('click', async () => {
++      await busy(elements.updateCoreButton, '检查中', async () => {
++        try {
++          const result = await api('core/update', {
++            method: 'POST',
++            body: '{}',
++          });
++          const changed = result.core.updated || result.dashboard.updated;
++          notify(changed ? '内核和面板已更新' : '已经是最新版本');
++          await reload();
++        } catch (error) {
++          notify(error.message, true);
++        }
++      });
++    });
++
++    elements.autoUpdate.addEventListener('change', async () => {
++      try {
++        const interval = Math.max(1, Number(elements.intervalHours.value) || 24);
++        await api('auto-update', {
++          method: 'POST',
++          body: JSON.stringify({
++            enabled: elements.autoUpdate.checked,
++            interval_hours: interval,
++          }),
++        });
++        notify(elements.autoUpdate.checked ? '自动更新已开启' : '自动更新已关闭');
++      } catch (error) {
++        elements.autoUpdate.checked = !elements.autoUpdate.checked;
++        notify(error.message, true);
++      }
++    });
++
++    elements.intervalHours.addEventListener('change', async () => {
++      const interval = Math.max(1, Number(elements.intervalHours.value) || 24);
++      elements.intervalHours.value = String(interval);
++      try {
++        await api('auto-update', {
++          method: 'POST',
++          body: JSON.stringify({
++            enabled: elements.autoUpdate.checked,
++            interval_hours: interval,
++          }),
++        });
++        notify('检查间隔已保存');
++      } catch (error) {
++        notify(error.message, true);
++      }
++    });
++
++    elements.modeControl.addEventListener('click', async event => {
++      const button = event.target.closest('button[data-mode]');
++      if (!button) return;
++      await busy(button, '切换中', async () => {
++        try {
++          await api('mode', {
++            method: 'POST',
++            body: JSON.stringify({ mode: button.dataset.mode }),
++          });
++          for (const item of elements.modeControl.querySelectorAll('button')) {
++            item.classList.toggle('active', item === button);
++          }
++          notify(`已切换到${button.textContent}模式`);
++        } catch (error) {
++          notify(error.message, true);
++        }
++      });
++    });
++
++    elements.reloadNodesButton.addEventListener('click', async () => {
++      await busy(elements.reloadNodesButton, '刷新中', async () => {
++        try {
++          renderGroups(await api('nodes'));
++        } catch (error) {
++          notify(error.message, true);
++        }
++      });
++    });
++
++    reload();
++  </script>
++</body>
++</html>
+-- 
+2.50.1.windows.1
+

@@ -52,6 +52,7 @@ The current upstream-based checkout uses Chromium commit
    ```powershell
    git am <path-to-this-repo>\patches\0002-restore-google-account-sync-ui.patch
    git am <path-to-this-repo>\patches\0003-Add-browser-control-CLI-and-proxy-management.patch
+   git am <path-to-this-repo>\patches\0004-Add-managed-Mihomo-proxy-dashboard.patch
    ```
 
 3. Put the private Google API key, OAuth client ID, and OAuth client secret in
@@ -70,7 +71,30 @@ The current upstream-based checkout uses Chromium commit
    .\ccchrome.cmd open https://example.com
    .\ccchrome.cmd tabs
    .\ccchrome.cmd proxy show
+   .\ccchrome.cmd proxy setup
+   .\ccchrome.cmd proxy dashboard
    ```
+
+## Managed proxy
+
+Patch `0004` adds an on-demand Mihomo proxy core, subscription management,
+automatic core/dashboard updates with rollback, node selection and testing,
+and a local Chinese proxy settings page. The Advanced dashboard opens the
+bundled MetaCubeXD traffic, connection, rule, and log views.
+
+Mihomo, MetaCubeXD, subscriptions, generated proxy configuration, logs, and
+process state are downloaded or created under `src/out/browserctl/mihomo`.
+They are intentionally excluded from Git. After restoring the source patches,
+install the current official runtime files with:
+
+```powershell
+.\ccchrome.cmd proxy setup [clash-or-mihomo-subscription-url]
+```
+
+The core starts only in managed proxy mode and exits with the managed browser.
+Direct and system proxy modes do not start it. Complete Clash/Mihomo YAML
+subscriptions and local YAML files are supported; raw Base64 URI lists must be
+converted to Clash/Mihomo YAML first.
 
 ## Google sync verification
 
